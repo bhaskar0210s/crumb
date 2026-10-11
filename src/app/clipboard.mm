@@ -2,6 +2,7 @@
 
 #import "app.h"
 
+#import <ApplicationServices/ApplicationServices.h>
 #import <ImageIO/ImageIO.h>
 #import <QuartzCore/QuartzCore.h>
 
@@ -44,15 +45,47 @@ std::string head(NSData* data) {
     return std::string(crumb::utf8Prefix(all, crumb::Store::kHeadBytes));
 }
 
+// Reads the first item on a pasteboard through a reference of Crumb's own, let go as soon as the copy is read:
+// NSPasteboard keeps everything read through it in memory until the next copy, tens of megabytes for a screenshot.
+class Reader {
+public:
+    explicit Reader(NSPasteboard* pasteboard) {
+        // AppKit's general pasteboard is Carbon's clipboard.
+        CFStringRef name = [pasteboard.name isEqualToString:NSPasteboardNameGeneral] ? kPasteboardClipboard
+                                                                                     : (__bridge CFStringRef)pasteboard.name;
+        if (PasteboardCreate(name, &pasteboard_) != noErr) {
+            pasteboard_ = nullptr;
+            return;
+        }
+        PasteboardSynchronize(pasteboard_);
+        if (PasteboardGetItemIdentifier(pasteboard_, 1, &item_) != noErr) item_ = nullptr;
+    }
+    ~Reader() {
+        if (pasteboard_) CFRelease(pasteboard_);
+    }
+    Reader(const Reader&) = delete;
+    Reader& operator=(const Reader&) = delete;
+
+    NSData* data(NSPasteboardType type) const {
+        CFDataRef data = nullptr;
+        if (!item_ || PasteboardCopyItemFlavorData(pasteboard_, item_, (__bridge CFStringRef)type, &data) != noErr) return nil;
+        return CFBridgingRelease(data);
+    }
+
+private:
+    PasteboardRef pasteboard_ = nullptr;
+    PasteboardItemID item_ = nullptr;
+};
+
 NSData* mapped(const std::string& path) {
     return [NSData dataWithContentsOfFile:@(path.c_str()) options:NSDataReadingMappedIfSafe error:nil];
 }
 
-// The largest picture in a source (TIFFs often hold 1x and 2x versions), and whether it is stored on its side.
-size_t largestImage(CGImageSourceRef source, double& width, double& height, bool& rotated) {
+// The largest picture in a source (TIFFs often hold 1x and 2x versions) and its EXIF orientation (1 is upright).
+size_t largestImage(CGImageSourceRef source, double& width, double& height, int& orientation) {
     size_t best = 0;
     width = height = 0;
-    rotated = false;
+    orientation = 1;
     const size_t count = CGImageSourceGetCount(source);
     for (size_t i = 0; i < count; ++i) {
         CFDictionaryRef props = CGImageSourceCopyPropertiesAtIndex(source, i, nullptr);
@@ -62,26 +95,31 @@ size_t largestImage(CGImageSourceRef source, double& width, double& height, bool
             CFNumberGetValue(n, kCFNumberDoubleType, &w);
         if (auto n = static_cast<CFNumberRef>(CFDictionaryGetValue(props, kCGImagePropertyPixelHeight)))
             CFNumberGetValue(n, kCFNumberDoubleType, &h);
-        int orientation = 1;
+        int o = 1;
         if (auto n = static_cast<CFNumberRef>(CFDictionaryGetValue(props, kCGImagePropertyOrientation)))
-            CFNumberGetValue(n, kCFNumberIntType, &orientation);
+            CFNumberGetValue(n, kCFNumberIntType, &o);
         CFRelease(props);
         if (w * h > width * height) {
             width = w;
             height = h;
             best = i;
-            rotated = orientation >= 5 && orientation <= 8;
+            orientation = o;
         }
     }
     return best;
 }
 
-NSData* encodePNG(CGImageRef image) {
+// PNG from either a decoded picture or, straight from its source, a picture that is already upright: ImageIO then
+// never needs the whole picture decoded at once, and a screenshot converts with less than half the memory.
+NSData* encodePNG(CGImageRef image, CGImageSourceRef source = nullptr, size_t index = 0) {
     NSMutableData* data = [NSMutableData data];
     CGImageDestinationRef dest =
         CGImageDestinationCreateWithData((__bridge CFMutableDataRef)data, CFSTR("public.png"), 1, nullptr);
     if (!dest) return nil;
-    CGImageDestinationAddImage(dest, image, nullptr);
+    if (image)
+        CGImageDestinationAddImage(dest, image, nullptr);
+    else
+        CGImageDestinationAddImageFromSource(dest, source, index, nullptr);
     const bool ok = CGImageDestinationFinalize(dest);
     CFRelease(dest);
     return ok ? data : nil;
@@ -225,25 +263,33 @@ void writeThumbnail(CGImageSourceRef source, size_t index, double width, double 
     }
 
     NSPasteboardItem* first = items.firstObject;
-    NSData* text = [first dataForType:NSPasteboardTypeString];
-    NSData* rtf = [first dataForType:NSPasteboardTypeRTF];
-    NSData* html = [first dataForType:NSPasteboardTypeHTML];
-    if (text.length == 0) text = [[pasteboard stringForType:NSPasteboardTypeString] dataUsingEncoding:NSUTF8StringEncoding];
-    if (text.length == 0 && rtf.length) {
-        NSAttributedString* styled = [[NSAttributedString alloc] initWithRTF:rtf documentAttributes:nil];
-        text = [styled.string dataUsingEncoding:NSUTF8StringEncoding];
-    }
-
-    NSString* imageType = nil;
+    NSData* text = nil;
+    NSData* rtf = nil;
+    NSData* html = nil;
     NSData* image = nil;
-    for (NSPasteboardType type in @[ NSPasteboardTypePNG, kJPEG, NSPasteboardTypeTIFF ]) {
-        if ([first.types containsObject:type] && (image = [first dataForType:type]).length) {
-            imageType = type;
-            break;
+    NSString* imageType = nil;
+    {
+        const Reader reader(pasteboard);  // let go before saving starts
+        text = reader.data(NSPasteboardTypeString);
+        rtf = reader.data(NSPasteboardTypeRTF);
+        html = reader.data(NSPasteboardTypeHTML);
+        if (text.length == 0) text = [[pasteboard stringForType:NSPasteboardTypeString] dataUsingEncoding:NSUTF8StringEncoding];
+        if (text.length == 0 && rtf.length) {
+            NSAttributedString* styled = [[NSAttributedString alloc] initWithRTF:rtf documentAttributes:nil];
+            text = [styled.string dataUsingEncoding:NSUTF8StringEncoding];
+        }
+        // A picture is kept when there is no text, or when the text only labels it (such as its URL).
+        if (text.length == 0 || (rtf.length == 0 && isLabel(text))) {
+            for (NSPasteboardType type in @[ NSPasteboardTypePNG, kJPEG, NSPasteboardTypeTIFF ]) {
+                if ([first.types containsObject:type] && (image = reader.data(type)).length) {
+                    imageType = type;
+                    break;
+                }
+            }
         }
     }
 
-    if (image && (text.length == 0 || (rtf.length == 0 && isLabel(text))))
+    if (image)
         [self saveImage:image type:imageType label:text];
     else if (text.length)
         [self saveText:text rtf:rtf html:html];
@@ -342,22 +388,27 @@ void writeThumbnail(CGImageSourceRef source, size_t index, double width, double 
                              CGImageSourceCreateWithData((__bridge CFDataRef)image, (__bridge CFDictionaryRef)options);
                          if (!source) return item;
                          double width = 0, height = 0;
-                         bool rotated = false;
-                         const size_t index = largestImage(source, width, height, rotated);
+                         int orientation = 1;
+                         const size_t index = largestImage(source, width, height, orientation);
+                         const bool rotated = orientation >= 5 && orientation <= 8;
                          NSData* stored = image;
                          bool jpeg = [type isEqualToString:kJPEG];
                          if ([type isEqualToString:NSPasteboardTypeTIFF] || index != 0) {
                              // TIFF is usually uncompressed; PNG keeps the same pixels in a fraction of the space.
-                             // Drawn upright, as PNG has no orientation tag.
-                             NSDictionary* upright = @{
-                                 (id)kCGImageSourceCreateThumbnailFromImageAlways : @YES,
-                                 (id)kCGImageSourceCreateThumbnailWithTransform : @YES,
-                                 (id)kCGImageSourceThumbnailMaxPixelSize : @(std::max(width, height)),
-                             };
-                             CGImageRef decoded = CGImageSourceCreateThumbnailAtIndex(source, index, (__bridge CFDictionaryRef)upright);
-                             stored = decoded ? encodePNG(decoded) : nil;
+                             // A turned picture is drawn upright first, as Crumb treats every PNG as upright.
+                             if (orientation == 1) {
+                                 stored = encodePNG(nullptr, source, index);
+                             } else {
+                                 NSDictionary* upright = @{
+                                     (id)kCGImageSourceCreateThumbnailFromImageAlways : @YES,
+                                     (id)kCGImageSourceCreateThumbnailWithTransform : @YES,
+                                     (id)kCGImageSourceThumbnailMaxPixelSize : @(std::max(width, height)),
+                                 };
+                                 CGImageRef decoded = CGImageSourceCreateThumbnailAtIndex(source, index, (__bridge CFDictionaryRef)upright);
+                                 stored = decoded ? encodePNG(decoded) : nil;
+                                 CGImageRelease(decoded);
+                             }
                              jpeg = false;
-                             CGImageRelease(decoded);
                          }
                          if (rotated) std::swap(width, height);  // the size as the picture is shown
                          if (stored && width >= 1 && height >= 1) {

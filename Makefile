@@ -1,5 +1,5 @@
 APP       := Crumb
-VERSION   := 1.1.0
+VERSION   := 1.2.0
 BUILD     := build
 BUNDLE    := $(BUILD)/$(APP).app
 BINARY    := $(BUNDLE)/Contents/MacOS/$(APP)
@@ -9,20 +9,19 @@ PREFIX    ?= /Applications
 REPOSITORY ?= $(shell git remote get-url origin 2>/dev/null | sed -E 's,^(git@github\.com:|https://github\.com/),,; s,\.git$$,,')
 
 CXX       := clang++
-ARCH      ?= arm64
-MIN_MACOS := 13.0
-TARGET    := $(foreach a,$(ARCH),-arch $(a)) -mmacosx-version-min=$(MIN_MACOS)
+MIN_MACOS := 27.0
+TARGET    := -arch arm64 -mmacosx-version-min=$(MIN_MACOS)
 
 CORE_SRC  := $(wildcard src/core/*.cpp)
 APP_SRC   := $(wildcard src/app/*.mm)
 CORE_OBJ  := $(CORE_SRC:src/%.cpp=$(BUILD)/obj/%.o)
 APP_OBJ   := $(APP_SRC:src/%.mm=$(BUILD)/obj/%.o)
 
-CXXFLAGS  += $(TARGET) -std=c++20 -Os -Wall -Wextra -Wshadow -Wno-unused-parameter -fvisibility=hidden -MMD -MP
+CXXFLAGS  += $(TARGET) -std=c++20 -Oz -flto -Wall -Wextra -Wshadow -Wno-unused-parameter -fvisibility=hidden -MMD -MP
 OBJCFLAGS := -fobjc-arc
-LDFLAGS   += $(TARGET) -dead_strip
+LDFLAGS   += $(TARGET) -dead_strip -flto
 LIBS      := -framework AppKit -framework Carbon -framework ServiceManagement -framework ImageIO -framework QuartzCore \
-             -framework CoreText -framework Security
+             -framework CoreText -framework Security -framework IOSurface
 
 ICON      := resources/$(APP).icns
 RESOURCES := $(BUNDLE)/Contents/Info.plist $(if $(wildcard $(ICON)),$(BUNDLE)/Contents/Resources/$(APP).icns)

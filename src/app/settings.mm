@@ -11,6 +11,7 @@ namespace {
 
 constexpr CGFloat kRowHeight = 40;
 constexpr CGFloat kSide = 16;
+constexpr CGFloat kNotice = 44;  // the note about pasteboard access, when there is one
 
 NSDictionary* textAttributes(CGFloat size, NSFontWeight weight, NSColor* color) {
     return @{NSFontAttributeName : [NSFont systemFontOfSize:size weight:weight], NSForegroundColorAttributeName : color};
@@ -137,6 +138,7 @@ void drawText(NSString* text, CGFloat x, CGFloat midY, NSDictionary* attributes)
     NSView* _check;
     NSString* _status;
     NSArray<NSString*>* _labels;
+    NSString* _notice;  // why copies may not be saved
 }
 
 - (instancetype)initWithUpdater:(CRUpdater*)updater checkButton:(NSView*)checkButton {
@@ -191,12 +193,24 @@ void drawText(NSString* text, CGFloat x, CGFloat midY, NSDictionary* attributes)
     return YES;
 }
 
+- (CGFloat)rowsTop {
+    return 8 + (_notice ? kNotice : 0);
+}
+
 - (CGFloat)preferredHeight {
-    return 8 + _labels.count * kRowHeight + 30 + 36;
+    return self.rowsTop + _labels.count * kRowHeight + 30 + 36;
 }
 
 - (BOOL)recording {
     return _shortcut.recording;
+}
+
+- (NSResponder*)returnResponder {
+    return _shortcut.returnResponder;
+}
+
+- (void)setReturnResponder:(NSResponder*)responder {
+    _shortcut.returnResponder = responder;
 }
 
 - (void)refresh {
@@ -204,6 +218,14 @@ void drawText(NSString* text, CGFloat x, CGFloat midY, NSDictionary* attributes)
     _login.on = SMAppService.mainAppService.status == SMAppServiceStatusEnabled;
     _updates.on = [defaults boolForKey:CRCheckForUpdatesKey];
     _size.value = [defaults integerForKey:CRHistorySizeKey];
+    // macOS lets each app read what other apps copied only if the user allows it.
+    switch (NSPasteboard.generalPasteboard.accessBehavior) {
+        case NSPasteboardAccessBehaviorAsk: _notice = @"macOS asks before Crumb can save each copy."; break;
+        case NSPasteboardAccessBehaviorAlwaysDeny: _notice = @"macOS doesn't let Crumb save copies."; break;
+        default: _notice = nil; break;
+    }
+    [self layoutControls];
+    self.needsDisplay = YES;
 }
 
 - (void)setFrameSize:(NSSize)size {
@@ -212,9 +234,9 @@ void drawText(NSString* text, CGFloat x, CGFloat midY, NSDictionary* attributes)
 }
 
 - (void)layoutControls {
-    const CGFloat width = self.bounds.size.width;
+    const CGFloat width = self.bounds.size.width, top = self.rowsTop;
     auto row = [&](NSInteger index, NSView* control, NSSize size) {
-        control.frame = NSMakeRect(width - kSide - size.width, 8 + index * kRowHeight + std::round((kRowHeight - size.height) / 2),
+        control.frame = NSMakeRect(width - kSide - size.width, top + index * kRowHeight + std::round((kRowHeight - size.height) / 2),
                                    size.width, size.height);
     };
     NSInteger index = 0;
@@ -223,23 +245,28 @@ void drawText(NSString* text, CGFloat x, CGFloat midY, NSDictionary* attributes)
     if (_updates) row(index++, _updates, NSMakeSize(34, 20));
     row(index++, _size, NSMakeSize(104, 26));
     if (_check) {
-        const CGFloat y = 8 + _labels.count * kRowHeight + 30;
+        const CGFloat y = top + _labels.count * kRowHeight + 30;
         _check.frame = NSMakeRect(width - kSide + 10 - 140, y + 4, 140, 28);
     }
 }
 
 - (void)drawRect:(NSRect)dirtyRect {
-    const CGFloat width = self.bounds.size.width;
+    const CGFloat width = self.bounds.size.width, rowsTop = self.rowsTop;
+    if (_notice) {
+        drawText(_notice, kSide, 8 + 13, textAttributes(12, NSFontWeightSemibold, NSColor.systemOrangeColor));
+        drawText(@"Allow it in System Settings → Privacy & Security → Paste from Other Apps.", kSide, 8 + 31,
+                 textAttributes(11, NSFontWeightRegular, NSColor.secondaryLabelColor));
+    }
     NSDictionary* label = textAttributes(13, NSFontWeightRegular, NSColor.labelColor);
     for (NSUInteger i = 0; i < _labels.count; ++i) {
-        const CGFloat top = 8 + i * kRowHeight;
+        const CGFloat top = rowsTop + i * kRowHeight;
         drawText(_labels[i], kSide, top + kRowHeight / 2, label);
         if (i + 1 < _labels.count) {
             [NSColor.separatorColor setFill];
             NSRectFill(NSMakeRect(kSide, top + kRowHeight - 0.5, width - 2 * kSide, 1));
         }
     }
-    const CGFloat hintTop = 8 + _labels.count * kRowHeight;
+    const CGFloat hintTop = rowsTop + _labels.count * kRowHeight;
     drawText(@"In the list: ⌘1–⌘9 copy an entry, ⌥⌫ deletes one, Esc closes.", kSide, hintTop + 15,
              textAttributes(11, NSFontWeightRegular, NSColor.secondaryLabelColor));
     NSString* version = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"";

@@ -720,12 +720,12 @@ bool usingInputMethod() {
 - (void)setLinkDetectionType:(NSTextInputTraitType)type {}
 - (NSTextInputTraitType)textCompletionType { return NSTextInputTraitTypeNo; }
 - (void)setTextCompletionType:(NSTextInputTraitType)type {}
-- (NSTextInputTraitType)inlinePredictionType API_AVAILABLE(macos(14.0)) { return NSTextInputTraitTypeNo; }
-- (void)setInlinePredictionType:(NSTextInputTraitType)type API_AVAILABLE(macos(14.0)) {}
-- (NSTextInputTraitType)mathExpressionCompletionType API_AVAILABLE(macos(15.0)) { return NSTextInputTraitTypeNo; }
-- (void)setMathExpressionCompletionType:(NSTextInputTraitType)type API_AVAILABLE(macos(15.0)) {}
-- (NSWritingToolsBehavior)writingToolsBehavior API_AVAILABLE(macos(15.0)) { return NSWritingToolsBehaviorNone; }
-- (void)setWritingToolsBehavior:(NSWritingToolsBehavior)behavior API_AVAILABLE(macos(15.0)) {}
+- (NSTextInputTraitType)inlinePredictionType { return NSTextInputTraitTypeNo; }
+- (void)setInlinePredictionType:(NSTextInputTraitType)type {}
+- (NSTextInputTraitType)mathExpressionCompletionType { return NSTextInputTraitTypeNo; }
+- (void)setMathExpressionCompletionType:(NSTextInputTraitType)type {}
+- (NSWritingToolsBehavior)writingToolsBehavior { return NSWritingToolsBehaviorNone; }
+- (void)setWritingToolsBehavior:(NSWritingToolsBehavior)behavior {}
 
 - (NSString*)query {
     return _query;
@@ -1106,24 +1106,46 @@ NSFont* previewFont() {
 
 @end
 
-// A picture, drawn directly.
+namespace {
+
+// A picture decoded at the size it is shown, upright.
+CF<CGImageRef> decodePicture(NSURL* url, CGFloat maxPixels) {
+    CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)url, nullptr);
+    if (!source) return {};
+    NSDictionary* options = @{
+        (id)kCGImageSourceCreateThumbnailFromImageAlways : @YES,
+        (id)kCGImageSourceCreateThumbnailWithTransform : @YES,
+        (id)kCGImageSourceThumbnailMaxPixelSize : @(maxPixels),
+    };
+    CF<CGImageRef> picture(CGImageSourceCreateThumbnailAtIndex(source, 0, (__bridge CFDictionaryRef)options));
+    CFRelease(source);
+    return picture;
+}
+
+}  // namespace
+
+// A picture, drawn directly. Once drawn, the decoded picture is let go: the layer holds the pixels.
 @interface CRImagePreview : CRView
-- (instancetype)initWithImage:(CGImageRef)image size:(NSSize)size;
+- (instancetype)initWithPicture:(CF<CGImageRef>)picture url:(NSURL*)url maxPixels:(CGFloat)maxPixels size:(NSSize)size;
 @end
 
 @implementation CRImagePreview {
     CF<CGImageRef> _image;
+    NSURL* _url;
+    CGFloat _maxPixels;
 }
 
-- (instancetype)initWithImage:(CGImageRef)image size:(NSSize)size {
+- (instancetype)initWithPicture:(CF<CGImageRef>)picture url:(NSURL*)url maxPixels:(CGFloat)maxPixels size:(NSSize)size {
     if ((self = [super initWithFrame:NSMakeRect(0, 0, size.width + 16, size.height + 16)])) {
-        CGImageRetain(image);
-        _image = CF<CGImageRef>(image);
+        _image = std::move(picture);
+        _url = url;
+        _maxPixels = maxPixels;
     }
     return self;
 }
 
 - (void)drawRect:(NSRect)dirtyRect {
+    if (!_image) _image = decodePicture(_url, _maxPixels);  // drawn again, such as on another display
     CGContextRef ctx = NSGraphicsContext.currentContext.CGContext;
     const CGRect rect = NSInsetRect(self.bounds, 8, 8);
     CGContextSaveGState(ctx);
@@ -1136,6 +1158,7 @@ NSFont* previewFont() {
     CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
     CGContextDrawImage(ctx, CGRectMake(0, 0, rect.size.width, rect.size.height), _image.get());
     CGContextRestoreGState(ctx);
+    _image = CF<CGImageRef>();
 }
 
 @end
@@ -1307,6 +1330,7 @@ NSFont* previewFont() {
             };
         }
         _page = [[CRSettingsPage alloc] initWithUpdater:self.updater checkButton:check];
+        _page.returnResponder = _header;
         _page.onLimit = ^(NSInteger limit) {
             CRPopup* popup = weakSelf;
             if (popup.onLimit) popup.onLimit(limit);
@@ -1593,20 +1617,11 @@ NSFont* previewFont() {
         const CGFloat w = std::max<CGFloat>(1, item.width / 2.0), h = std::max<CGFloat>(1, item.height / 2.0);
         const CGFloat fit = std::min({CGFloat(1), (kPreviewMaxWidth - 16) / w, (maxHeight - 16) / h});
         const NSSize size = NSMakeSize(std::max<CGFloat>(1, std::round(w * fit)), std::max<CGFloat>(1, std::round(h * fit)));
-        CGImageRef picture = nullptr;
         NSURL* url = [NSURL fileURLWithPath:@(_store->imageFile(item).c_str())];
-        if (CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)url, nullptr)) {
-            NSDictionary* options = @{
-                (id)kCGImageSourceCreateThumbnailFromImageAlways : @YES,
-                (id)kCGImageSourceCreateThumbnailWithTransform : @YES,
-                (id)kCGImageSourceThumbnailMaxPixelSize : @(std::ceil(std::max(size.width, size.height) * scale)),
-            };
-            picture = CGImageSourceCreateThumbnailAtIndex(source, 0, (__bridge CFDictionaryRef)options);
-            CFRelease(source);
-        }
+        const CGFloat maxPixels = std::ceil(std::max(size.width, size.height) * scale);
+        CF<CGImageRef> picture = decodePicture(url, maxPixels);
         if (!picture) return;
-        view = [[CRImagePreview alloc] initWithImage:picture size:size];
-        CGImageRelease(picture);
+        view = [[CRImagePreview alloc] initWithPicture:std::move(picture) url:url maxPixels:maxPixels size:size];
     } else {
         // A few spare bytes let the cut fall on a character boundary.
         std::string bytes =

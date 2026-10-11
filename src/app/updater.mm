@@ -13,14 +13,23 @@
 namespace {
 
 NSString* const kLastCheckKey = @"lastUpdateCheck";
-#if defined(__x86_64__)
-NSString* const kAsset = @"Crumb-Intel.zip";
-#else
 NSString* const kAsset = @"Crumb.zip";
-#endif
 constexpr NSTimeInterval kCheckInterval = 24 * 60 * 60;
 
 enum class Result { UpToDate, Installed, Failed };
+
+// Whether this Mac's macOS is new enough for a bundle (its LSMinimumSystemVersion).
+bool runsHere(NSDictionary* info) {
+    NSString* minimum = info[@"LSMinimumSystemVersion"];
+    if (![minimum isKindOfClass:NSString.class]) return true;
+    NSArray<NSString*>* parts = [minimum componentsSeparatedByString:@"."];
+    const NSOperatingSystemVersion version = {
+        parts.count > 0 ? parts[0].integerValue : 0,
+        parts.count > 1 ? parts[1].integerValue : 0,
+        parts.count > 2 ? parts[2].integerValue : 0,
+    };
+    return [NSProcessInfo.processInfo isOperatingSystemAtLeastVersion:version];
+}
 
 NSData* run(NSString* tool, NSArray<NSString*>* arguments, int* status) {
     NSTask* task = [NSTask new];
@@ -126,6 +135,7 @@ Result update(const Source& source, NSString* current, NSString* bundlePath, NSS
     if (status != 0 || ![info[@"CFBundleIdentifier"] isEqual:identifier] || ![version isKindOfClass:NSString.class] ||
         !crumb::isNewerVersion(version.UTF8String, current.UTF8String))
         return fail(@"The download isn't a newer Crumb.");
+    if (!runsHere(info)) return fail([NSString stringWithFormat:@"Crumb %@ needs a newer version of macOS.", version]);
     run(@"/usr/bin/codesign", @[ @"--verify", @"--deep", @"--strict", app ], &status);
     if (status != 0) return fail(@"The download is damaged.");
 

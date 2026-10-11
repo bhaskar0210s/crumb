@@ -4,6 +4,8 @@
 
 #import "app.h"
 
+#import <IOSurface/IOSurface.h>
+
 #include <algorithm>
 #include <cmath>
 
@@ -131,23 +133,36 @@ void CRRenderIntoLayer(NSView* view, void (^draw)(NSRect bounds)) {
         view.layer.contents = nil;
         return;
     }
-    CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    CGContextRef ctx =
-        CGBitmapContextCreate(nullptr, width, height, 8, 0, space, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Host);
-    CGColorSpaceRelease(space);
-    if (!ctx) return;
-    CGContextScaleCTM(ctx, scale, scale);
-    CGContextTranslateCTM(ctx, 0, size.height);
-    CGContextScaleCTM(ctx, 1, -1);
-    [NSGraphicsContext saveGraphicsState];
-    NSGraphicsContext.currentContext = [NSGraphicsContext graphicsContextWithCGContext:ctx flipped:YES];
-    draw(view.bounds);
-    [NSGraphicsContext restoreGraphicsState];
-    CGImageRef image = CGBitmapContextCreateImage(ctx);
-    CGContextRelease(ctx);
-    view.layer.contentsScale = scale;
-    view.layer.contents = (__bridge id)image;
-    CGImageRelease(image);
+    static CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    static CFPropertyListRef spaceDescription = CGColorSpaceCopyPropertyList(space);
+    NSDictionary* properties = @{
+        (id)kIOSurfaceWidth : @(width),
+        (id)kIOSurfaceHeight : @(height),
+        (id)kIOSurfaceBytesPerElement : @4,
+        (id)kIOSurfacePixelFormat : @(0x42475241),  // 'BGRA'
+    };
+    IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)properties);
+    if (!surface) return;
+    IOSurfaceSetValue(surface, kIOSurfaceColorSpace, spaceDescription);
+    IOSurfaceLock(surface, 0, nullptr);
+    CGContextRef ctx = CGBitmapContextCreate(IOSurfaceGetBaseAddress(surface), width, height, 8, IOSurfaceGetBytesPerRow(surface),
+                                             space, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Host);
+    if (ctx) {
+        CGContextScaleCTM(ctx, scale, scale);
+        CGContextTranslateCTM(ctx, 0, size.height);
+        CGContextScaleCTM(ctx, 1, -1);
+        [NSGraphicsContext saveGraphicsState];
+        NSGraphicsContext.currentContext = [NSGraphicsContext graphicsContextWithCGContext:ctx flipped:YES];
+        draw(view.bounds);
+        [NSGraphicsContext restoreGraphicsState];
+        CGContextRelease(ctx);
+    }
+    IOSurfaceUnlock(surface, 0, nullptr);
+    if (ctx) {
+        view.layer.contentsScale = scale;
+        view.layer.contents = (__bridge id)surface;
+    }
+    CFRelease(surface);
 }
 
 @implementation CRView

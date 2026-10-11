@@ -11,25 +11,19 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-15
+    runs-on: xcode-27
     steps:
       - uses: actions/checkout@v4
-      # The newest Xcode on the runner: apps built with an older SDK get the previous macOS look.
-      - name: Use the newest Xcode
-        run: |
-          xcode=$(python3 -c "import glob, re; apps = [a for a in glob.glob('/Applications/Xcode_*.app') if 'beta' not in a.lower() and 'release_candidate' not in a.lower()]; print(max(apps, key=lambda a: [int(n) for n in re.findall(r'\\d+', a.split('Xcode_')[1])]))")
-          sudo xcode-select -s "$xcode"
-          xcodebuild -version
+      - name: Xcode
+        run: xcodebuild -version
       - name: Unit tests
         run: make test
-      - name: Build (Apple silicon and Intel)
+      - name: Build
         run: |
           make VERSION="${GITHUB_REF_NAME#v}" REPOSITORY="$GITHUB_REPOSITORY"
-          make VERSION="${GITHUB_REF_NAME#v}" REPOSITORY="$GITHUB_REPOSITORY" ARCH=x86_64 BUILD=build/intel
       - name: Package
         run: |
           ditto -c -k --keepParent build/Crumb.app Crumb.zip
-          ditto -c -k --keepParent build/intel/Crumb.app Crumb-Intel.zip
       # Installed copies only accept updates signed with the release key (its public half is in Info.plist).
       - name: Sign
         env:
@@ -37,14 +31,12 @@ jobs:
         run: |
           umask 077
           printf '%s\n' "$UPDATE_SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
-          for zip in Crumb.zip Crumb-Intel.zip; do
-            openssl dgst -sha256 -sign "$RUNNER_TEMP/key.pem" -out "$zip.sig" "$zip"
-          done
+          openssl dgst -sha256 -sign "$RUNNER_TEMP/key.pem" -out Crumb.zip.sig Crumb.zip
           rm "$RUNNER_TEMP/key.pem"
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" Crumb.zip Crumb-Intel.zip Crumb.zip.sig Crumb-Intel.zip.sig \
+          gh release create "$GITHUB_REF_NAME" Crumb.zip Crumb.zip.sig \
             --title "Crumb ${GITHUB_REF_NAME#v}" \
-            --notes "Free and open source. Download Crumb.zip for Apple silicon Macs or Crumb-Intel.zip for Intel Macs, unzip it and move Crumb.app to Applications. See the README for first-launch steps."
+            --notes "Free and open source. For Macs with Apple silicon running macOS 27 or later: download Crumb.zip, unzip it and move Crumb.app to Applications. See the README for first-launch steps."

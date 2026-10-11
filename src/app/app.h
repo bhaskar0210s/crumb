@@ -14,8 +14,9 @@ extern NSString* const CRHotKeyModifiersKey;
 extern NSString* const CRHistorySizeKey;
 extern NSString* const CRCheckForUpdatesKey;
 
-// Renders a view's drawing on the CPU into an 8-bit image used as its layer's contents. The system's own
-// drawing path moves larger views onto the GPU, which loads a couple of megabytes of shaders for good.
+// Renders a view's drawing on the CPU into an IOSurface used as its layer's contents. The window server composites
+// straight from that memory, so the pixels exist once (an image would be copied for it). The system's own drawing
+// path moves larger views onto the GPU, which loads a couple of megabytes of shaders for good.
 void CRRenderIntoLayer(NSView* view, void (^draw)(NSRect bounds));
 
 // A flipped view drawn through CRRenderIntoLayer: subclasses just implement drawRect:.
@@ -63,6 +64,7 @@ void CRRenderIntoLayer(NSView* view, void (^draw)(NSRect bounds));
 @property(nonatomic, copy, nullable) void (^onLimit)(NSInteger limit);
 @property(nonatomic, readonly) CGFloat preferredHeight;
 @property(nonatomic, readonly) BOOL recording;  // the shortcut field is waiting for keys
+@property(nonatomic, weak, nullable) NSResponder* returnResponder;  // gets the keyboard back after recording
 - (void)refresh;
 - (void)checkForUpdates;
 @end

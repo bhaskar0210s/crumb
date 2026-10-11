@@ -7,28 +7,21 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: xcode-27
     steps:
       - uses: actions/checkout@v4
-      # The newest Xcode on the runner: apps built with an older SDK get the previous macOS look.
-      - name: Use the newest Xcode
-        run: |
-          xcode=$(python3 -c "import glob, re; apps = [a for a in glob.glob('/Applications/Xcode_*.app') if 'beta' not in a.lower() and 'release_candidate' not in a.lower()]; print(max(apps, key=lambda a: [int(n) for n in re.findall(r'\\d+', a.split('Xcode_')[1])]))")
-          sudo xcode-select -s "$xcode"
-          xcodebuild -version
+      - name: Xcode
+        run: xcodebuild -version
       - name: Unit tests
         run: make test
-      - name: Build (Apple silicon and Intel)
+      - name: Build
         run: |
           make REPOSITORY="$GITHUB_REPOSITORY"
-          make REPOSITORY="$GITHUB_REPOSITORY" ARCH=x86_64 BUILD=build/intel
       - name: Package
         run: |
           ditto -c -k --keepParent build/Crumb.app Crumb.zip
-          ditto -c -k --keepParent build/intel/Crumb.app Crumb-Intel.zip
       - uses: actions/upload-artifact@v4
         with:
           name: Crumb
           path: |
             Crumb.zip
-            Crumb-Intel.zip
