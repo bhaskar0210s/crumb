@@ -1,4 +1,5 @@
-// The Settings window: one small pane, built when opened and freed when closed.
+// The settings page, shown inside the list's own panel (the gear in its footer). Everything is drawn by Crumb
+// itself: a separate window and the standard controls would cost several megabytes of memory for four options.
 
 #import "app.h"
 
@@ -8,306 +9,263 @@
 
 namespace {
 
-constexpr CGFloat kWindowWidth = 460;
-constexpr CGFloat kMargin = 20;
-constexpr CGFloat kRowHeight = 44;
-constexpr CGFloat kHeadingHeight = 28;
+constexpr CGFloat kRowHeight = 40;
+constexpr CGFloat kSide = 16;
 
-NSTextField* label(NSString* text, CGFloat size, NSFontWeight weight, NSColor* color) {
-    NSTextField* field = [NSTextField labelWithString:text];
-    field.font = [NSFont systemFontOfSize:size weight:weight];
-    field.textColor = color;
-    [field sizeToFit];
-    return field;
+NSDictionary* textAttributes(CGFloat size, NSFontWeight weight, NSColor* color) {
+    return @{NSFontAttributeName : [NSFont systemFontOfSize:size weight:weight], NSForegroundColorAttributeName : color};
 }
 
-NSColor* groupFill() {
-    if (@available(macOS 14.0, *)) return NSColor.quaternarySystemFillColor;
-    return [NSColor.labelColor colorWithAlphaComponent:0.04];
+void drawText(NSString* text, CGFloat x, CGFloat midY, NSDictionary* attributes) {
+    const NSSize size = [text sizeWithAttributes:attributes];
+    [text drawAtPoint:NSMakePoint(x, std::round(midY - size.height / 2)) withAttributes:attributes];
 }
 
 }  // namespace
 
-@interface CRSettingsWindow : NSWindow
+#pragma mark - Controls
+
+// An on/off switch. Flips the moment it is clicked.
+@interface CRToggle : CRView
+@property(nonatomic) BOOL on;
+@property(nonatomic, copy) void (^onChange)(BOOL on);
 @end
 
-@implementation CRSettingsWindow
-
-- (BOOL)performKeyEquivalent:(NSEvent*)event {
-    // Views first: the shortcut field records ⌘W or ⌘Q like any other shortcut.
-    if ([super performKeyEquivalent:event]) return YES;
-    const NSEventModifierFlags flags = event.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagShift |
-                                                              NSEventModifierFlagOption | NSEventModifierFlagControl);
-    NSString* key = CRKeyCharacter(event);
-    if (flags == NSEventModifierFlagCommand && [key isEqualToString:@"w"]) {
-        [self performClose:nil];
-        return YES;
-    }
-    if (flags == NSEventModifierFlagCommand && [key isEqualToString:@"q"]) {
-        [NSApp terminate:nil];
-        return YES;
-    }
-    return CRHandleEditingKey(event);
-}
-
-@end
-
-@interface CRSettingsView : NSView
-@end
-
-@implementation CRSettingsView
+@implementation CRToggle
 
 - (BOOL)isFlipped {
     return YES;
 }
 
-@end
-
-// A rounded group of rows with hairlines between them, like System Settings.
-@interface CRGroupView : NSView
-@property(nonatomic) NSInteger rows;
-@end
-
-@implementation CRGroupView
-
-- (BOOL)isFlipped {
+- (BOOL)acceptsFirstMouse:(NSEvent*)event {
     return YES;
+}
+
+- (void)setOn:(BOOL)on {
+    _on = on;
+    self.needsDisplay = YES;
 }
 
 - (void)drawRect:(NSRect)dirtyRect {
-    [groupFill() setFill];
-    [[NSBezierPath bezierPathWithRoundedRect:self.bounds xRadius:10 yRadius:10] fill];
-    [NSColor.separatorColor setFill];
-    for (NSInteger i = 1; i < self.rows; ++i) NSRectFill(NSMakeRect(12, i * kRowHeight, self.bounds.size.width - 24, 1));
+    const NSRect track = self.bounds;
+    const CGFloat radius = track.size.height / 2;
+    [(self.on ? NSColor.controlAccentColor : [NSColor.labelColor colorWithAlphaComponent:0.16]) setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:track xRadius:radius yRadius:radius] fill];
+    const CGFloat knob = track.size.height - 4;
+    const NSRect circle = NSMakeRect(self.on ? NSMaxX(track) - knob - 2 : 2, 2, knob, knob);
+    [[NSColor.blackColor colorWithAlphaComponent:0.12] setFill];
+    [[NSBezierPath bezierPathWithOvalInRect:NSOffsetRect(circle, 0, 0.5)] fill];
+    [NSColor.whiteColor setFill];
+    [[NSBezierPath bezierPathWithOvalInRect:circle] fill];
+}
+
+- (void)mouseDown:(NSEvent*)event {
+    self.on = !self.on;
+    if (self.onChange) self.onChange(self.on);
 }
 
 @end
 
-@implementation CRSettings {
-    CRUpdater* _updater;
-    NSWindow* _window;
-    CRShortcutField* _shortcut;
-    NSSwitch* _login;
-    NSSwitch* _updates;
-    NSTextField* _size;
-    NSStepper* _stepper;
-    NSTextField* _status;
-    NSButton* _checkButton;
+// − value + : steps of ten.
+@interface CRStepper : CRView
+@property(nonatomic) NSInteger value;
+@property(nonatomic) NSInteger minimum, maximum, step;
+@property(nonatomic, copy) void (^onChange)(NSInteger value);
+@end
+
+@implementation CRStepper
+
+- (BOOL)isFlipped {
+    return YES;
 }
 
-- (instancetype)initWithUpdater:(CRUpdater*)updater {
-    if ((self = [super init])) _updater = updater;
+- (BOOL)acceptsFirstMouse:(NSEvent*)event {
+    return YES;
+}
+
+- (void)setValue:(NSInteger)value {
+    _value = value;
+    self.needsDisplay = YES;
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    const NSRect box = self.bounds;
+    [[NSColor.labelColor colorWithAlphaComponent:0.08] setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:box xRadius:7 yRadius:7] fill];
+    const CGFloat third = box.size.width / 3;
+    NSDictionary* sign = textAttributes(15, NSFontWeightMedium, NSColor.secondaryLabelColor);
+    NSDictionary* number = @{
+        NSFontAttributeName : [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightMedium],
+        NSForegroundColorAttributeName : NSColor.labelColor,
+    };
+    auto centered = [&](NSString* text, CGFloat midX, NSDictionary* attributes) {
+        const NSSize size = [text sizeWithAttributes:attributes];
+        [text drawAtPoint:NSMakePoint(std::round(midX - size.width / 2), std::round(NSMidY(box) - size.height / 2))
+           withAttributes:attributes];
+    };
+    centered(@"−", third / 2, sign);
+    centered([NSString stringWithFormat:@"%ld", (long)self.value], NSMidX(box), number);
+    centered(@"+", box.size.width - third / 2, sign);
+}
+
+- (void)mouseDown:(NSEvent*)event {
+    const NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    const CGFloat third = self.bounds.size.width / 3;
+    NSInteger value = self.value;
+    if (point.x < third)
+        value -= self.step;
+    else if (point.x > 2 * third)
+        value += self.step;
+    else
+        return;
+    value = std::clamp(value, self.minimum, self.maximum);
+    if (value == self.value) return;
+    self.value = value;
+    if (self.onChange) self.onChange(value);
+}
+
+@end
+
+#pragma mark - Page
+
+@implementation CRSettingsPage {
+    CRUpdater* _updater;
+    CRShortcutField* _shortcut;
+    CRToggle* _login;
+    CRToggle* _updates;
+    CRStepper* _size;
+    NSView* _check;
+    NSString* _status;
+    NSArray<NSString*>* _labels;
+}
+
+- (instancetype)initWithUpdater:(CRUpdater*)updater checkButton:(NSView*)checkButton {
+    if ((self = [super initWithFrame:NSZeroRect])) {
+        _updater = updater;
+        NSUserDefaults* defaults = NSUserDefaults.standardUserDefaults;
+
+        _shortcut = [[CRShortcutField alloc] initWithFrame:NSZeroRect];
+        _shortcut.keyCode = static_cast<UInt32>([defaults integerForKey:CRHotKeyCodeKey]);
+        _shortcut.modifiers = static_cast<UInt32>([defaults integerForKey:CRHotKeyModifiersKey]);
+        [self addSubview:_shortcut];
+
+        __weak CRSettingsPage* weakSelf = self;
+        _login = [[CRToggle alloc] initWithFrame:NSZeroRect];
+        _login.onChange = ^(BOOL on) {
+            [weakSelf setLaunchAtLogin:on];
+        };
+        [self addSubview:_login];
+
+        NSMutableArray* labels = [NSMutableArray arrayWithObjects:@"Open Crumb", @"Launch at login", nil];
+        if (_updater.available) {
+            [labels addObject:@"Check for updates automatically"];
+            _updates = [[CRToggle alloc] initWithFrame:NSZeroRect];
+            _updates.onChange = ^(BOOL on) {
+                [NSUserDefaults.standardUserDefaults setBool:on forKey:CRCheckForUpdatesKey];
+            };
+            [self addSubview:_updates];
+        }
+        [labels addObject:@"History size"];
+        _labels = labels;
+
+        _size = [[CRStepper alloc] initWithFrame:NSZeroRect];
+        _size.minimum = 10;
+        _size.maximum = 1000;
+        _size.step = 10;
+        _size.onChange = ^(NSInteger value) {
+            CRSettingsPage* page = weakSelf;
+            [NSUserDefaults.standardUserDefaults setInteger:value forKey:CRHistorySizeKey];
+            if (page.onLimit) page.onLimit(value);
+        };
+        [self addSubview:_size];
+
+        _check = checkButton;
+        if (_check) [self addSubview:_check];
+        [self refresh];
+        [self layoutControls];
+    }
     return self;
 }
 
-- (void)show {
-    if (!_window) [self build];
-    [self refresh];
-    if (@available(macOS 14.0, *))
-        [NSApp activate];
-    else
-        [NSApp activateIgnoringOtherApps:YES];
-    [_window makeKeyAndOrderFront:nil];
-    [_window makeFirstResponder:nil];  // no field starts out focused
+- (BOOL)isFlipped {
+    return YES;
 }
 
-- (void)build {
-    NSUserDefaults* defaults = NSUserDefaults.standardUserDefaults;
-    CRSettingsView* view = [[CRSettingsView alloc] initWithFrame:NSZeroRect];
-    const CGFloat groupWidth = kWindowWidth - 2 * kMargin;
-    CGFloat y = 14;
+- (CGFloat)preferredHeight {
+    return 8 + _labels.count * kRowHeight + 30 + 36;
+}
 
-    auto heading = [&](NSString* text) {
-        NSTextField* field = label(text, 13, NSFontWeightSemibold, NSColor.labelColor);
-        field.frame = NSMakeRect(kMargin + 4, y + 4, field.frame.size.width, field.frame.size.height);
-        [view addSubview:field];
-        y += kHeadingHeight;
-    };
-    auto group = [&](NSInteger rows) {
-        CRGroupView* box = [[CRGroupView alloc] initWithFrame:NSMakeRect(kMargin, y, groupWidth, rows * kRowHeight)];
-        box.rows = rows;
-        [view addSubview:box];
-        y += rows * kRowHeight;
-        return box;
-    };
-    auto rowLabel = [&](CRGroupView* box, NSInteger row, NSString* text) {
-        NSTextField* field = label(text, 13, NSFontWeightRegular, NSColor.labelColor);
-        const NSSize size = field.frame.size;
-        field.frame = NSMakeRect(14, row * kRowHeight + std::round((kRowHeight - size.height) / 2), size.width, size.height);
-        [box addSubview:field];
-    };
-    auto place = [&](CRGroupView* box, NSInteger row, NSView* control, NSSize size) {
-        control.frame = NSMakeRect(box.bounds.size.width - 14 - size.width,
-                                   row * kRowHeight + std::round((kRowHeight - size.height) / 2), size.width, size.height);
-        [box addSubview:control];
-    };
-
-    heading(@"General");
-    const NSInteger generalRows = _updater.available ? 3 : 2;
-    CRGroupView* general = group(generalRows);
-    rowLabel(general, 0, @"Open Crumb");
-    _shortcut = [[CRShortcutField alloc] initWithFrame:NSZeroRect];
-    _shortcut.keyCode = static_cast<UInt32>([defaults integerForKey:CRHotKeyCodeKey]);
-    _shortcut.modifiers = static_cast<UInt32>([defaults integerForKey:CRHotKeyModifiersKey]);
-    place(general, 0, _shortcut, NSMakeSize(112, 26));
-
-    rowLabel(general, 1, @"Launch at login");
-    _login = [[NSSwitch alloc] initWithFrame:NSZeroRect];
-    _login.controlSize = NSControlSizeSmall;
-    _login.target = self;
-    _login.action = @selector(toggleLogin:);
-    [_login sizeToFit];
-    place(general, 1, _login, _login.frame.size);
-
-    if (_updater.available) {
-        rowLabel(general, 2, @"Check for updates automatically");
-        _updates = [[NSSwitch alloc] initWithFrame:NSZeroRect];
-        _updates.controlSize = NSControlSizeSmall;
-        _updates.target = self;
-        _updates.action = @selector(toggleUpdates:);
-        [_updates sizeToFit];
-        place(general, 2, _updates, _updates.frame.size);
-    }
-
-    NSTextField* hint = label(@"In the list: ⌘1–⌘9 copy an entry, ⌥⌫ deletes one, Esc closes.", 11, NSFontWeightRegular,
-                              NSColor.secondaryLabelColor);
-    hint.frame = NSMakeRect(kMargin + 4, y + 6, groupWidth - 8, hint.frame.size.height);
-    [view addSubview:hint];
-    y += 30;
-
-    heading(@"Storage");
-    CRGroupView* storage = group(1);
-    rowLabel(storage, 0, @"History size");
-    _stepper = [[NSStepper alloc] initWithFrame:NSZeroRect];
-    _stepper.minValue = 1;
-    _stepper.maxValue = 1000;
-    _stepper.increment = 10;
-    _stepper.valueWraps = NO;
-    _stepper.target = self;
-    _stepper.action = @selector(stepSize:);
-    [_stepper sizeToFit];
-    place(storage, 0, _stepper, _stepper.frame.size);
-
-    NSNumberFormatter* formatter = [NSNumberFormatter new];
-    formatter.numberStyle = NSNumberFormatterNoStyle;
-    formatter.minimum = @1;
-    formatter.maximum = @1000;
-    formatter.allowsFloats = NO;
-    _size = [[NSTextField alloc] initWithFrame:NSZeroRect];
-    _size.formatter = formatter;
-    _size.alignment = NSTextAlignmentRight;
-    _size.font = [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightRegular];
-    _size.target = self;
-    _size.action = @selector(typeSize:);
-    _size.cell.sendsActionOnEndEditing = YES;
-    _size.bezelStyle = NSTextFieldRoundedBezel;
-    const NSRect stepper = _stepper.frame;
-    _size.frame = NSMakeRect(NSMinX(stepper) - 4 - 64, std::round((kRowHeight - 24) / 2), 64, 24);
-    [storage addSubview:_size];
-
-    y += 18;
-    NSString* version = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"";
-    NSTextField* about = label([NSString stringWithFormat:@"Crumb %@", version], 11, NSFontWeightRegular, NSColor.secondaryLabelColor);
-    about.frame = NSMakeRect(kMargin + 4, y + 6, about.frame.size.width, about.frame.size.height);
-    [view addSubview:about];
-    if (_updater.available) {
-        _checkButton = [NSButton buttonWithTitle:@"Check for Updates" target:self action:@selector(checkNow:)];
-        _checkButton.controlSize = NSControlSizeSmall;
-        _checkButton.font = [NSFont systemFontOfSize:11];
-        [_checkButton sizeToFit];
-        const NSSize size = _checkButton.frame.size;
-        _checkButton.frame = NSMakeRect(kWindowWidth - kMargin - size.width, y + 2, size.width, size.height);
-        [view addSubview:_checkButton];
-        _status = label(@"", 11, NSFontWeightRegular, NSColor.secondaryLabelColor);
-        _status.frame = NSMakeRect(NSMaxX(about.frame) + 10, y + 6, NSMinX(_checkButton.frame) - NSMaxX(about.frame) - 20,
-                                   about.frame.size.height);
-        _status.lineBreakMode = NSLineBreakByTruncatingTail;
-        [view addSubview:_status];
-    }
-    y += 36;
-
-    view.frame = NSMakeRect(0, 0, kWindowWidth, y);
-    _window = [[CRSettingsWindow alloc] initWithContentRect:view.frame
-                                          styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
-                                            backing:NSBackingStoreBuffered
-                                              defer:YES];
-    _window.title = @"Crumb Settings";
-    _window.contentView = view;
-    _window.releasedWhenClosed = NO;
-    _window.animationBehavior = NSWindowAnimationBehaviorNone;
-    _window.delegate = self;
-    [_window center];
+- (BOOL)recording {
+    return _shortcut.recording;
 }
 
 - (void)refresh {
     NSUserDefaults* defaults = NSUserDefaults.standardUserDefaults;
-    _login.state = SMAppService.mainAppService.status == SMAppServiceStatusEnabled ? NSControlStateValueOn : NSControlStateValueOff;
-    _updates.state = [defaults boolForKey:CRCheckForUpdatesKey] ? NSControlStateValueOn : NSControlStateValueOff;
-    const NSInteger size = [defaults integerForKey:CRHistorySizeKey];
-    _size.integerValue = size;
-    _stepper.integerValue = size;
+    _login.on = SMAppService.mainAppService.status == SMAppServiceStatusEnabled;
+    _updates.on = [defaults boolForKey:CRCheckForUpdatesKey];
+    _size.value = [defaults integerForKey:CRHistorySizeKey];
 }
 
-// Leaving the window ends a shortcut recording (restoring the shortcut) and commits a typed history size.
-- (void)windowDidResignKey:(NSNotification*)notification {
-    [_window makeFirstResponder:nil];
+- (void)setFrameSize:(NSSize)size {
+    [super setFrameSize:size];
+    [self layoutControls];
 }
 
-- (void)windowWillClose:(NSNotification*)notification {
-    [_window makeFirstResponder:nil];
-    // Settings are rarely open: let the whole window go and give the focus back.
-    _window.delegate = nil;
-    _window = nil;
-    _shortcut = nil;
-    _login = nil;
-    _updates = nil;
-    _size = nil;
-    _stepper = nil;
-    _status = nil;
-    _checkButton = nil;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [NSApp hide:nil];
-    });
+- (void)layoutControls {
+    const CGFloat width = self.bounds.size.width;
+    auto row = [&](NSInteger index, NSView* control, NSSize size) {
+        control.frame = NSMakeRect(width - kSide - size.width, 8 + index * kRowHeight + std::round((kRowHeight - size.height) / 2),
+                                   size.width, size.height);
+    };
+    NSInteger index = 0;
+    row(index++, _shortcut, NSMakeSize(104, 26));
+    row(index++, _login, NSMakeSize(34, 20));
+    if (_updates) row(index++, _updates, NSMakeSize(34, 20));
+    row(index++, _size, NSMakeSize(104, 26));
+    if (_check) {
+        const CGFloat y = 8 + _labels.count * kRowHeight + 30;
+        _check.frame = NSMakeRect(width - kSide + 10 - 140, y + 4, 140, 28);
+    }
 }
 
-- (void)toggleLogin:(NSSwitch*)sender {
+- (void)drawRect:(NSRect)dirtyRect {
+    const CGFloat width = self.bounds.size.width;
+    NSDictionary* label = textAttributes(13, NSFontWeightRegular, NSColor.labelColor);
+    for (NSUInteger i = 0; i < _labels.count; ++i) {
+        const CGFloat top = 8 + i * kRowHeight;
+        drawText(_labels[i], kSide, top + kRowHeight / 2, label);
+        if (i + 1 < _labels.count) {
+            [NSColor.separatorColor setFill];
+            NSRectFill(NSMakeRect(kSide, top + kRowHeight - 0.5, width - 2 * kSide, 1));
+        }
+    }
+    const CGFloat hintTop = 8 + _labels.count * kRowHeight;
+    drawText(@"In the list: ⌘1–⌘9 copy an entry, ⌥⌫ deletes one, Esc closes.", kSide, hintTop + 15,
+             textAttributes(11, NSFontWeightRegular, NSColor.secondaryLabelColor));
+    NSString* version = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"";
+    NSString* line = [NSString stringWithFormat:@"Crumb %@", version];
+    if (_status.length) line = [line stringByAppendingFormat:@"  ·  %@", _status];
+    drawText(line, kSide, hintTop + 30 + 18, textAttributes(11, NSFontWeightRegular, NSColor.secondaryLabelColor));
+}
+
+- (void)setLaunchAtLogin:(BOOL)on {
     NSError* error = nil;
     SMAppService* service = SMAppService.mainAppService;
-    const BOOL on = sender.state == NSControlStateValueOn;
     const BOOL ok = on ? [service registerAndReturnError:&error] : [service unregisterAndReturnError:&error];
     if (!ok && service.status == SMAppServiceStatusRequiresApproval) [SMAppService openSystemSettingsLoginItems];
     [self refresh];
 }
 
-- (void)toggleUpdates:(NSSwitch*)sender {
-    [NSUserDefaults.standardUserDefaults setBool:sender.state == NSControlStateValueOn forKey:CRCheckForUpdatesKey];
-}
-
-- (void)applySize:(NSInteger)size {
-    size = std::clamp<NSInteger>(size, 1, 1000);
-    [NSUserDefaults.standardUserDefaults setInteger:size forKey:CRHistorySizeKey];
-    _size.integerValue = size;
-    _stepper.integerValue = size;
-    if (self.onLimit) self.onLimit(size);
-}
-
-- (void)stepSize:(NSStepper*)sender {
-    [self applySize:sender.integerValue];
-}
-
-- (void)typeSize:(NSTextField*)sender {
-    [self applySize:sender.integerValue];
-}
-
-- (void)checkNow:(id)sender {
-    _checkButton.enabled = NO;
-    _status.stringValue = @"Checking…";
-    __weak CRSettings* weakSelf = self;
+- (void)checkForUpdates {
+    if (!_updater.available) return;
+    _status = @"Checking…";
+    self.needsDisplay = YES;
+    __weak CRSettingsPage* weakSelf = self;
     [_updater checkNow:^(NSString* status) {
-        CRSettings* settings = weakSelf;
-        if (!settings) return;
-        settings->_status.stringValue = status;
-        settings->_checkButton.enabled = YES;
+        CRSettingsPage* page = weakSelf;
+        if (!page) return;
+        page->_status = status;
+        page.needsDisplay = YES;
     }];
 }
 

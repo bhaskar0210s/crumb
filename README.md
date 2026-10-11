@@ -4,7 +4,7 @@
 
 <p align="center"><b>A tiny clipboard history for your Mac.</b><br>
 Press <kbd>⇧</kbd><kbd>⌘</kbd><kbd>C</kbd> anywhere to see everything you copied: text, pictures and files.<br>
-Under 400 KB on disk, 10 to 20 MB of memory, no CPU while idle.</p>
+About 400 KB on disk, 6 MB of memory at rest and under 10 MB in use, no CPU while idle.</p>
 
 <p align="center">
   <img src="docs/popup-dark.png" width="430" alt="Crumb's list in dark mode">
@@ -22,15 +22,15 @@ Under 400 KB on disk, 10 to 20 MB of memory, no CPU while idle.</p>
 - **Hover over an entry, or select it, for three seconds** to see the whole text or the full-size picture.
 - **Keeps everything you copy, in full**: text of any length (with its formatting), pictures and files, newest
   first. Copying something again moves it back to the top.
-- **Clear History** sits at the bottom of the list.
+- **Clear History** sits at the bottom of the list, next to the gear that opens the settings.
 
 <p align="center">
   <img src="docs/search-dark.png" width="430" alt="Fuzzy search with matched letters in bold">
-  <img src="docs/settings-dark.png" width="400" alt="Settings">
+  <img src="docs/settings-dark.png" width="430" alt="Settings">
 </p>
 
-Settings has only what you need: the shortcut, launch at login, automatic updates and how many entries to keep
-(100 by default).
+The settings open right inside the list and hold only what you need: the shortcut, launch at login, automatic
+updates and how many entries to keep (100 by default).
 
 ## Private by design
 
@@ -61,24 +61,30 @@ make install    # builds Crumb.app, copies it to /Applications and starts it
 ```
 
 The first launch from Applications adds Crumb to your login items and shows its settings once. Crumb has no
-Dock icon and no menu bar icon: press the shortcut to use it, and open the app again (from Spotlight or Finder)
-whenever you want its settings.
+Dock icon and no menu bar icon: press the shortcut to use it, and use the gear in the list (or open the app again
+from Spotlight) for its settings.
 
 ## How it stays small
 
-- **Native code only.** A C++ core keeps the history and does the searching; a thin AppKit layer draws the list
-  with Core Text. No web views, no third-party libraries.
+- **Native code only.** A C++ core keeps the history and does the searching; a thin AppKit layer draws everything
+  with Core Text and Core Graphics. No web views, no third-party libraries.
+- **No system text fields.** The search box is drawn by Crumb, which reads the keyboard itself. A standard text
+  field would load macOS's whole text engine and make the system start an AutoFill helper process (about 13 MB)
+  just for Crumb. Input methods (Chinese, Japanese, Korean…) still work: Crumb asks for the text input system
+  only while one of them is the current input source.
+- **Drawn on the CPU.** Every view renders into a plain 8-bit image. The system's default path moves larger views
+  onto the GPU, which loads a couple of megabytes of shaders that never go away.
+- **Nothing is kept while the list is closed.** Its window is built when you press the shortcut (in about 15 ms)
+  and torn down when it closes. Settings live inside the same panel instead of a window of their own.
 - **Only a little lives in memory.** Each entry keeps its first few kilobytes in memory for drawing and searching;
   full texts and pictures stay on disk until you preview or copy them. Pictures are shrunk once into small
-  thumbnails for the list.
-- **Nothing is kept around while the list is closed.** Its window is torn down on close and rebuilt, undrawn, in
-  the background, so it opens in a few milliseconds without holding any buffers in between.
+  thumbnails for the list, and previews lay out only the paragraphs in view.
 - **Cheap watching.** macOS doesn't announce copies, so Crumb reads the pasteboard's change count twice a
   second, which costs next to nothing.
 
-Measured in Activity Monitor on an Apple silicon Mac running macOS 27, with 100 entries saved: about 9 MB right
-after launch and about 20 MB once the list has been opened (the system's text and graphics caches load on first
-use), steady over hundreds of opens. CPU use while idle is 0.0%.
+Measured in Activity Monitor on an Apple silicon Mac running macOS 27, with a full history: about 6 MB right after
+launch and 9 to 10 MB once the list, search, previews and settings have been used, steady over hundreds of opens,
+with no helper processes. CPU use while idle is 0.0%.
 
 ## Tested
 

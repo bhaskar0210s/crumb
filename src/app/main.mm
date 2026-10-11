@@ -41,7 +41,6 @@ bool installedInApplications() {
     CRClipboard* _clipboard;
     CRPopup* _popup;
     CRUpdater* _updater;
-    CRSettings* _settings;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification*)notification {
@@ -60,14 +59,15 @@ bool installedInApplications() {
     _clipboard = [[CRClipboard alloc] initWithStore:_store.get()];
     _popup = [[CRPopup alloc] initWithStore:_store.get() clipboard:_clipboard];
     _updater = [[CRUpdater alloc] initWithPopup:_popup];
+    _popup.updater = _updater;
 
-    __weak CRAppDelegate* weakSelf = self;
     __weak CRPopup* weakPopup = _popup;
+    crumb::Store* store = _store.get();
     _clipboard.onChange = ^{
         [weakPopup reload];
     };
-    _popup.onSettings = ^{
-        [weakSelf showSettings];
+    _popup.onLimit = ^(NSInteger limit) {
+        store->setLimit(static_cast<size_t>(limit));
     };
     CRSetHotKeyAction(^{
         [weakPopup toggle];
@@ -81,12 +81,8 @@ bool installedInApplications() {
     if (![defaults boolForKey:kLaunchedBeforeKey]) {
         [defaults setBool:YES forKey:kLaunchedBeforeKey];
         if (installedInApplications()) [SMAppService.mainAppService registerAndReturnError:nil];
-        [self showSettings];  // there is no menu bar icon, so say hello once
+        [_popup showSettings];  // there is no menu bar icon, so say hello once
     }
-    // Build the list window ahead of time so that even the first open is instant.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 2), dispatch_get_main_queue(), ^{
-        [weakPopup prepare];
-    });
 }
 
 // Quitting waits (up to ten seconds) for copies that are still being saved.
@@ -109,21 +105,8 @@ bool installedInApplications() {
 
 // Opening Crumb again (from Finder or Spotlight) shows its settings.
 - (BOOL)applicationShouldHandleReopen:(NSApplication*)sender hasVisibleWindows:(BOOL)flag {
-    [self showSettings];
+    [_popup showSettings];
     return NO;
-}
-
-- (void)showSettings {
-    if (!_settings) {
-        _settings = [[CRSettings alloc] initWithUpdater:_updater];
-        crumb::Store* store = _store.get();
-        __weak CRPopup* weakPopup = _popup;
-        _settings.onLimit = ^(NSInteger limit) {
-            store->setLimit(static_cast<size_t>(limit));
-            [weakPopup reload];
-        };
-    }
-    [_settings show];
 }
 
 @end

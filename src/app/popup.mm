@@ -17,7 +17,7 @@
 namespace {
 
 constexpr CGFloat kWidth = 440;
-constexpr CGFloat kRadius = 16;   // panel corners
+constexpr CGFloat kRadius = 12;   // panel corners
 constexpr CGFloat kHeader = 46;
 constexpr CGFloat kFooter = 40;
 constexpr CGFloat kRow = 30;
@@ -31,7 +31,6 @@ constexpr double kPreviewDelay = 3.0;
 constexpr CGFloat kPreviewMaxWidth = 520;
 constexpr CGFloat kPreviewMaxHeight = 640;
 constexpr size_t kPreviewMaxBytes = 2 << 20;
-constexpr NSUInteger kMeasureLimit = 20000;  // longer previews just take the largest size
 
 // Owns one Core Foundation reference.
 template <class T>
@@ -170,15 +169,8 @@ NSImage* roundedMask(CGFloat radius) {
     return mask;
 }
 
-// Liquid Glass where the system has it (macOS 26 and later), the menu material before that. The class is
-// looked up at run time so that Crumb also builds with older SDKs.
+// The frosted material of macOS menus, with rounded corners.
 NSView* makeBackground(NSView* content, CGFloat radius) {
-    if (Class glassClass = NSClassFromString(@"NSGlassEffectView")) {
-        NSView* glass = [[glassClass alloc] initWithFrame:content.frame];
-        [glass setValue:@(radius) forKey:@"cornerRadius"];
-        [glass setValue:content forKey:@"contentView"];
-        return glass;
-    }
     NSVisualEffectView* effect = [[NSVisualEffectView alloc] initWithFrame:content.frame];
     effect.material = NSVisualEffectMaterialMenu;
     effect.state = NSVisualEffectStateActive;
@@ -214,9 +206,12 @@ bool trace() {
 }  // namespace
 
 @interface CRPopup ()
+@property(nonatomic, readonly) BOOL recording;
 - (BOOL)handleKeyEquivalent:(NSEvent*)event;
 - (void)listDidHover:(NSInteger)row;
 - (void)listDidClick:(NSInteger)row;
+- (void)queryChanged;
+- (void)performCommand:(SEL)command;
 @end
 
 #pragma mark - Panel
@@ -236,7 +231,8 @@ bool trace() {
 }
 
 - (BOOL)performKeyEquivalent:(NSEvent*)event {
-    return [self.popup handleKeyEquivalent:event] || CRHandleEditingKey(event) || [super performKeyEquivalent:event];
+    if (self.popup.recording) return [super performKeyEquivalent:event];  // the shortcut field takes every key
+    return [self.popup handleKeyEquivalent:event] || [super performKeyEquivalent:event];
 }
 
 @end
@@ -289,9 +285,10 @@ bool trace() {
         _pressed = -1;
         _selected = -1;
         // System colours are Display P3, which makes Core Animation choose a 64-bit backing store; 8 bits do.
+        // Drawn on the CPU into a plain image (see updateLayer): the system's own drawing path moves large views
+        // to the GPU, which loads a couple of megabytes of shaders that never go away.
         self.wantsLayer = YES;
-        self.layer.contentsFormat = kCAContentsFormatRGBA8Uint;
-        if (@available(macOS 14.0, *)) self.clipsToBounds = YES;  // rows scrolled half out must not spill over
+        self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawOnSetNeedsDisplay;
         [self addTrackingArea:[[NSTrackingArea alloc] initWithRect:NSZeroRect
                                                            options:NSTrackingMouseMoved | NSTrackingActiveAlways |
                                                                    NSTrackingInVisibleRect
@@ -411,7 +408,17 @@ bool trace() {
     return image;
 }
 
-- (void)drawRect:(NSRect)dirtyRect {
+- (BOOL)wantsUpdateLayer {
+    return YES;
+}
+
+- (void)updateLayer {
+    CRRenderIntoLayer(self, ^(NSRect bounds) {
+        [self drawRows:bounds];
+    });
+}
+
+- (void)drawRows:(NSRect)dirtyRect {
     CGContextRef ctx = NSGraphicsContext.currentContext.CGContext;
     const CGFloat width = self.bounds.size.width;
 
@@ -534,7 +541,7 @@ bool trace() {
 
 #pragma mark - Footer buttons
 
-@interface CRFooterButton : NSView
+@interface CRFooterButton : CRView
 @property(nonatomic, copy) NSString* title;
 @property(nonatomic) CRIcon icon;
 @property(nonatomic) BOOL hasIcon;
@@ -548,8 +555,6 @@ bool trace() {
 
 - (instancetype)initWithFrame:(NSRect)frame {
     if ((self = [super initWithFrame:frame])) {
-        self.wantsLayer = YES;
-        self.layer.contentsFormat = kCAContentsFormatRGBA8Uint;
         [self addTrackingArea:[[NSTrackingArea alloc] initWithRect:NSZeroRect
                                                            options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways |
                                                                    NSTrackingInVisibleRect
@@ -624,23 +629,7 @@ bool trace() {
 
 #pragma mark - Hairline
 
-@interface CRIconView : NSView
-@property(nonatomic) CRIcon icon;
-@end
-
-@implementation CRIconView
-
-- (BOOL)isFlipped {
-    return YES;
-}
-
-- (void)drawRect:(NSRect)dirtyRect {
-    CRDrawIcon(self.icon, self.bounds, NSColor.tertiaryLabelColor);
-}
-
-@end
-
-@interface CRRule : NSView
+@interface CRRule : CRView
 @end
 
 @implementation CRRule
@@ -652,6 +641,505 @@ bool trace() {
 
 @end
 
+#pragma mark - Header and search
+
+namespace {
+
+bool usingInputMethod() {
+    TISInputSourceRef source = TISCopyCurrentKeyboardInputSource();
+    if (!source) return false;
+    auto type = static_cast<CFStringRef>(TISGetInputSourceProperty(source, kTISPropertyInputSourceType));
+    const bool method = type && (CFEqual(type, kTISTypeKeyboardInputMode) || CFEqual(type, kTISTypeKeyboardInputMethodModeEnabled) ||
+                                 CFEqual(type, kTISTypeKeyboardInputMethodWithoutModes));
+    CFRelease(source);
+    return method;
+}
+
+}  // namespace
+
+// The title and, while searching, the query. Crumb reads the keyboard here itself (with input method support)
+// instead of using a system text field: those bring the whole text system along, plus an AutoFill helper
+// process.
+@interface CRHeaderView : CRView <NSTextInputClient, NSTextInputTraits>
+- (instancetype)initWithPopup:(CRPopup*)popup;
+@property(nonatomic, readonly) NSString* query;
+@property(nonatomic, copy) NSString* title;
+- (void)clear;
+- (void)paste;
+@end
+
+@implementation CRHeaderView {
+    __weak CRPopup* _popup;
+    NSMutableString* _query;
+    NSString* _marked;  // an input method's composition, not part of the query yet
+    CGFloat _caretX;
+}
+
+- (instancetype)initWithPopup:(CRPopup*)popup {
+    if ((self = [super initWithFrame:NSZeroRect])) {
+        _popup = popup;
+        _query = [NSMutableString string];
+        _title = @"Crumb";
+    }
+    return self;
+}
+
+- (BOOL)isFlipped {
+    return YES;
+}
+
+- (BOOL)acceptsFirstResponder {
+    return YES;
+}
+
+// With an ordinary keyboard layout Crumb reads keys itself and has no input context: a text input context makes
+// macOS start an AutoFill helper process (about 13 MB) for the app. Input methods (Chinese, Japanese, Korean…)
+// need one to compose text, so it exists only while one of them is the current input source.
+- (NSTextInputContext*)inputContext {
+    return usingInputMethod() ? [super inputContext] : nil;
+}
+
+// A search box wants none of the system's text services.
+- (NSTextInputTraitType)autocorrectionType { return NSTextInputTraitTypeNo; }
+- (void)setAutocorrectionType:(NSTextInputTraitType)type {}
+- (NSTextInputTraitType)spellCheckingType { return NSTextInputTraitTypeNo; }
+- (void)setSpellCheckingType:(NSTextInputTraitType)type {}
+- (NSTextInputTraitType)grammarCheckingType { return NSTextInputTraitTypeNo; }
+- (void)setGrammarCheckingType:(NSTextInputTraitType)type {}
+- (NSTextInputTraitType)smartQuotesType { return NSTextInputTraitTypeNo; }
+- (void)setSmartQuotesType:(NSTextInputTraitType)type {}
+- (NSTextInputTraitType)smartDashesType { return NSTextInputTraitTypeNo; }
+- (void)setSmartDashesType:(NSTextInputTraitType)type {}
+- (NSTextInputTraitType)smartInsertDeleteType { return NSTextInputTraitTypeNo; }
+- (void)setSmartInsertDeleteType:(NSTextInputTraitType)type {}
+- (NSTextInputTraitType)textReplacementType { return NSTextInputTraitTypeNo; }
+- (void)setTextReplacementType:(NSTextInputTraitType)type {}
+- (NSTextInputTraitType)dataDetectionType { return NSTextInputTraitTypeNo; }
+- (void)setDataDetectionType:(NSTextInputTraitType)type {}
+- (NSTextInputTraitType)linkDetectionType { return NSTextInputTraitTypeNo; }
+- (void)setLinkDetectionType:(NSTextInputTraitType)type {}
+- (NSTextInputTraitType)textCompletionType { return NSTextInputTraitTypeNo; }
+- (void)setTextCompletionType:(NSTextInputTraitType)type {}
+- (NSTextInputTraitType)inlinePredictionType API_AVAILABLE(macos(14.0)) { return NSTextInputTraitTypeNo; }
+- (void)setInlinePredictionType:(NSTextInputTraitType)type API_AVAILABLE(macos(14.0)) {}
+- (NSTextInputTraitType)mathExpressionCompletionType API_AVAILABLE(macos(15.0)) { return NSTextInputTraitTypeNo; }
+- (void)setMathExpressionCompletionType:(NSTextInputTraitType)type API_AVAILABLE(macos(15.0)) {}
+- (NSWritingToolsBehavior)writingToolsBehavior API_AVAILABLE(macos(15.0)) { return NSWritingToolsBehaviorNone; }
+- (void)setWritingToolsBehavior:(NSWritingToolsBehavior)behavior API_AVAILABLE(macos(15.0)) {}
+
+- (NSString*)query {
+    return _query;
+}
+
+- (void)setTitle:(NSString*)title {
+    _title = [title copy];
+    self.needsDisplay = YES;
+}
+
+- (void)clear {
+    [_query setString:@""];
+    _marked = nil;
+    if (self.inputContext) [self.inputContext discardMarkedText];
+    self.needsDisplay = YES;
+}
+
+- (void)changed {
+    self.needsDisplay = YES;
+    [_popup queryChanged];
+}
+
+// One line: line breaks and tabs become spaces.
+- (NSString*)singleLine:(id)string {
+    NSString* text = [string isKindOfClass:NSAttributedString.class] ? [string string] : string;
+    if (![text isKindOfClass:NSString.class]) return @"";
+    NSArray* parts = [text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet];
+    return [[parts componentsJoinedByString:@" "] stringByReplacingOccurrencesOfString:@"\t" withString:@" "];
+}
+
+- (void)paste {
+    NSString* text = [NSPasteboard.generalPasteboard stringForType:NSPasteboardTypeString];
+    if (!text.length) return;
+    if (text.length > 1000) text = [text substringToIndex:[text rangeOfComposedCharacterSequenceAtIndex:1000].location];
+    [_query appendString:[self singleLine:text]];
+    _marked = nil;
+    [self changed];
+}
+
+- (void)keyDown:(NSEvent*)event {
+    if (self.inputContext) {
+        [self interpretKeyEvents:@[ event ]];
+        return;
+    }
+    const NSEventModifierFlags flags = event.modifierFlags;
+    const bool option = flags & NSEventModifierFlagOption, command = flags & NSEventModifierFlagCommand;
+    const bool control = flags & NSEventModifierFlagControl;
+    SEL command_ = nullptr;
+    switch (event.keyCode) {
+        case kVK_UpArrow: command_ = @selector(moveUp:); break;
+        case kVK_DownArrow: command_ = @selector(moveDown:); break;
+        case kVK_PageUp: command_ = @selector(pageUp:); break;
+        case kVK_PageDown: command_ = @selector(pageDown:); break;
+        case kVK_Home: command_ = @selector(moveToBeginningOfDocument:); break;
+        case kVK_End: command_ = @selector(moveToEndOfDocument:); break;
+        case kVK_Return:
+        case kVK_ANSI_KeypadEnter: command_ = @selector(insertNewline:); break;
+        case kVK_Escape: command_ = @selector(cancelOperation:); break;
+        case kVK_Delete:
+            command_ = option ? @selector(deleteWordBackward:) : command ? @selector(deleteToBeginningOfLine:) : @selector(deleteBackward:);
+            break;
+        case kVK_ANSI_N: if (control) command_ = @selector(moveDown:); break;
+        case kVK_ANSI_P: if (control) command_ = @selector(moveUp:); break;
+        default: break;
+    }
+    if (command_) {
+        [self doCommandBySelector:command_];
+        return;
+    }
+    if (command || control) return;
+    // Printable characters only (the keyboard layout has already applied dead keys such as ⌥E E → é).
+    NSMutableString* text = [NSMutableString string];
+    NSString* characters = event.characters ?: @"";
+    for (NSUInteger i = 0; i < characters.length; ++i) {
+        const unichar c = [characters characterAtIndex:i];
+        if (c >= 0x20 && c != 0x7F && (c < 0xF700 || c > 0xF8FF)) [text appendFormat:@"%C", c];
+    }
+    if (text.length) [self insertText:text replacementRange:NSMakeRange(NSNotFound, 0)];
+}
+
+- (void)insertText:(id)string replacementRange:(NSRange)replacementRange {
+    NSString* text = [self singleLine:string];
+    _marked = nil;
+    if (!text.length) {
+        self.needsDisplay = YES;
+        return;
+    }
+    [_query appendString:text];
+    [self changed];
+}
+
+- (void)doCommandBySelector:(SEL)selector {
+    if (selector == @selector(deleteBackward:)) {
+        if (_query.length) {
+            [_query deleteCharactersInRange:[_query rangeOfComposedCharacterSequenceAtIndex:_query.length - 1]];
+            [self changed];
+        }
+        return;
+    }
+    if (selector == @selector(deleteToBeginningOfLine:) || selector == @selector(deleteToBeginningOfParagraph:)) {
+        if (_query.length) {
+            [_query setString:@""];
+            [self changed];
+        }
+        return;
+    }
+    [_popup performCommand:selector];
+}
+
+- (void)setMarkedText:(id)string selectedRange:(NSRange)selectedRange replacementRange:(NSRange)replacementRange {
+    NSString* text = [self singleLine:string];
+    _marked = text.length ? text : nil;
+    self.needsDisplay = YES;
+}
+
+- (void)unmarkText {
+    if (!_marked) return;
+    [_query appendString:_marked];
+    _marked = nil;
+    [self changed];
+}
+
+- (NSRange)selectedRange {
+    return NSMakeRange(_query.length + _marked.length, 0);
+}
+
+- (NSRange)markedRange {
+    return _marked.length ? NSMakeRange(_query.length, _marked.length) : NSMakeRange(NSNotFound, 0);
+}
+
+- (BOOL)hasMarkedText {
+    return _marked.length > 0;
+}
+
+- (NSAttributedString*)attributedSubstringForProposedRange:(NSRange)range actualRange:(NSRangePointer)actualRange {
+    NSString* all = [_query stringByAppendingString:_marked ?: @""];
+    const NSRange clipped = NSIntersectionRange(range, NSMakeRange(0, all.length));
+    if (actualRange) *actualRange = clipped;
+    return [[NSAttributedString alloc] initWithString:[all substringWithRange:clipped]];
+}
+
+- (NSArray<NSAttributedStringKey>*)validAttributesForMarkedText {
+    return @[];
+}
+
+// Input methods put their candidate window at the caret.
+- (NSRect)firstRectForCharacterRange:(NSRange)range actualRange:(NSRangePointer)actualRange {
+    if (actualRange) *actualRange = range;
+    const NSRect local = NSMakeRect(_caretX, 0, 1, self.bounds.size.height);
+    return [self.window convertRectToScreen:[self convertRect:local toView:nil]];
+}
+
+- (NSUInteger)characterIndexForPoint:(NSPoint)point {
+    return NSNotFound;
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    CGContextRef ctx = NSGraphicsContext.currentContext.CGContext;
+    const CGFloat height = self.bounds.size.height;
+    NSFont* titleFont = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
+    CF<CTLineRef> title = makeLine(self.title, titleFont);
+    drawLine(ctx, title.get(), 16, 0, height, titleFont, NSColor.labelColor);
+    _caretX = 16 + lineWidth(title.get()) + 14;
+    if (!_query.length && !_marked.length) return;  // the search field only shows while searching
+
+    CRDrawIcon(CRIconSearch, NSMakeRect(_caretX, std::round((height - 15) / 2), 15, 15), NSColor.tertiaryLabelColor);
+    const CGFloat x = _caretX + 21, available = self.bounds.size.width - x - 18;
+    NSFont* font = [NSFont systemFontOfSize:14];
+    NSMutableAttributedString* text = [[NSMutableAttributedString alloc]
+        initWithString:[_query stringByAppendingString:_marked ?: @""]
+            attributes:@{NSFontAttributeName : font, (__bridge NSString*)kCTForegroundColorFromContextAttributeName : @YES}];
+    if (_marked.length)
+        [text addAttribute:(__bridge NSString*)kCTUnderlineStyleAttributeName
+                     value:@(kCTUnderlineStyleSingle)
+                     range:NSMakeRange(_query.length, _marked.length)];
+    CF<CTLineRef> line(CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)text));
+    if (lineWidth(line.get()) > available) {  // keep the end of a long query in view
+        CF<CTLineRef> ellipsis = makeLine(@"…", font);
+        CTLineRef cut = CTLineCreateTruncatedLine(line.get(), available, kCTLineTruncationStart, ellipsis.get());
+        if (cut) line = CF<CTLineRef>(cut);
+    }
+    drawLine(ctx, line.get(), x, 0, height, font, NSColor.labelColor);
+    _caretX = x + lineWidth(line.get()) + 1;
+    [NSColor.controlAccentColor setFill];
+    NSRectFill(NSMakeRect(std::round(_caretX), std::round((height - 18) / 2), 2, 18));
+}
+
+@end
+
+#pragma mark - Previews
+
+namespace {
+
+constexpr CGFloat kPreviewInsetX = 14;
+constexpr CGFloat kPreviewInsetY = 12;
+constexpr NSUInteger kBlockChars = 2000;  // long paragraphs are laid out in pieces of about this size
+
+NSFont* previewFont() {
+    static NSFont* font = [NSFont systemFontOfSize:13];
+    return font;
+}
+
+}  // namespace
+
+// Text drawn with Core Text, laid out a paragraph at a time as it scrolls into view, so even megabytes of text
+// open at once and never pull in the system text engine.
+@interface CRTextPreview : CRView
+- (instancetype)initWithText:(NSString*)text maxWidth:(CGFloat)maxWidth maxHeight:(CGFloat)maxHeight;
+@end
+
+@implementation CRTextPreview {
+    NSString* _text;
+    struct Block {
+        uint32_t location, length;
+        float height;
+        bool measured;
+    };
+    std::vector<Block> _blocks;
+    std::vector<CGFloat> _tops;  // top of each block, plus the total height at the end
+    std::unordered_map<size_t, CF<CTFrameRef>> _frames;
+    CGFloat _textWidth, _lineHeight, _offset;
+    BOOL _scrolling;
+    NSInteger _scrollGeneration;
+}
+
+- (instancetype)initWithText:(NSString*)text maxWidth:(CGFloat)maxWidth maxHeight:(CGFloat)maxHeight {
+    if ((self = [super initWithFrame:NSZeroRect])) {
+        _text = text;
+        _textWidth = maxWidth - 2 * kPreviewInsetX;
+        NSFont* font = previewFont();
+        _lineHeight = std::ceil(font.ascender - font.descender + font.leading);
+        [self split];
+        [self updateTops:0];
+        CGFloat width = maxWidth;
+        if (text.length <= 20000) {  // short texts get a snug window
+            CGFloat widest = 0;
+            for (size_t i = 0; i < _blocks.size(); ++i) widest = std::max(widest, [self measure:i]);
+            [self updateTops:0];
+            width = std::min(maxWidth, std::ceil(widest) + 2 * kPreviewInsetX + 2);
+        }
+        const CGFloat height = std::min(maxHeight, _tops.back() + 2 * kPreviewInsetY);
+        self.frame = NSMakeRect(0, 0, std::max<CGFloat>(width, 120), std::max<CGFloat>(height, 36));
+    }
+    return self;
+}
+
+- (BOOL)isFlipped {
+    return YES;
+}
+
+- (void)split {
+    const NSUInteger length = _text.length;
+    NSCharacterSet* newlines = NSCharacterSet.newlineCharacterSet;
+    NSCharacterSet* spaces = NSCharacterSet.whitespaceCharacterSet;
+    NSUInteger start = 0;
+    while (start < length || (start == 0 && length == 0)) {
+        const NSRange lineBreak = [_text rangeOfCharacterFromSet:newlines options:0 range:NSMakeRange(start, length - start)];
+        const NSUInteger end = lineBreak.location == NSNotFound ? length : lineBreak.location;
+        NSUInteger piece = start;
+        do {
+            NSUInteger cut = std::min(end, piece + kBlockChars);
+            if (cut < end) {
+                const NSRange space = [_text rangeOfCharacterFromSet:spaces
+                                                             options:NSBackwardsSearch
+                                                               range:NSMakeRange(piece + kBlockChars / 2, cut - piece - kBlockChars / 2)];
+                cut = space.location != NSNotFound ? space.location + 1 : [_text rangeOfComposedCharacterSequenceAtIndex:cut].location;
+                if (cut <= piece) cut = std::min(end, piece + kBlockChars);
+            }
+            _blocks.push_back({static_cast<uint32_t>(piece), static_cast<uint32_t>(cut - piece), 0, false});
+            piece = cut;
+        } while (piece < end);
+        if (lineBreak.location == NSNotFound) break;
+        start = NSMaxRange(lineBreak);
+        if ([_text characterAtIndex:lineBreak.location] == '\r' && start < length && [_text characterAtIndex:start] == '\n') ++start;
+    }
+    const CGFloat perLine = std::max<CGFloat>(1, _textWidth / (previewFont().pointSize * 0.52));
+    for (auto& block : _blocks)
+        block.height = static_cast<float>(_lineHeight * std::max<CGFloat>(1, std::ceil(block.length / perLine)));
+}
+
+- (NSAttributedString*)stringFor:(size_t)index {
+    const Block& block = _blocks[index];
+    NSString* text = [_text substringWithRange:NSMakeRange(block.location, block.length)];
+    return [[NSAttributedString alloc]
+        initWithString:text
+            attributes:@{NSFontAttributeName : previewFont(), (__bridge NSString*)kCTForegroundColorFromContextAttributeName : @YES}];
+}
+
+// Lays out one block; returns its width.
+- (CGFloat)measure:(size_t)index {
+    Block& block = _blocks[index];
+    if (block.length == 0) {
+        block.height = static_cast<float>(_lineHeight);
+        block.measured = true;
+        return 0;
+    }
+    CTFramesetterRef setter = CTFramesetterCreateWithAttributedString((__bridge CFAttributedStringRef)[self stringFor:index]);
+    const CGSize size = CTFramesetterSuggestFrameSizeWithConstraints(setter, CFRangeMake(0, 0), nullptr,
+                                                                     CGSizeMake(_textWidth, CGFLOAT_MAX), nullptr);
+    CFRelease(setter);
+    block.height = static_cast<float>(std::ceil(size.height));
+    block.measured = true;
+    return size.width;
+}
+
+- (void)updateTops:(size_t)from {
+    _tops.resize(_blocks.size() + 1);
+    if (from == 0) _tops[0] = 0;
+    for (size_t i = from; i < _blocks.size(); ++i) _tops[i + 1] = _tops[i] + _blocks[i].height;
+}
+
+- (size_t)blockAt:(CGFloat)y {
+    auto it = std::upper_bound(_tops.begin(), _tops.end() - 1, y);
+    return it == _tops.begin() ? 0 : static_cast<size_t>(it - _tops.begin()) - 1;
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    if (_blocks.empty()) return;
+    const CGFloat visibleTop = _offset, visibleBottom = _offset + self.bounds.size.height;
+    // Measure what is about to show; real heights replace the estimates.
+    size_t first = [self blockAt:std::max<CGFloat>(0, visibleTop - kPreviewInsetY)];
+    for (size_t i = first; i < _blocks.size() && _tops[i] < visibleBottom; ++i) {
+        if (_blocks[i].measured) continue;
+        [self measure:i];
+        [self updateTops:i];
+    }
+    first = [self blockAt:std::max<CGFloat>(0, visibleTop - kPreviewInsetY)];
+    if (_frames.size() > 64) _frames.clear();
+
+    CGContextRef ctx = NSGraphicsContext.currentContext.CGContext;
+    CGColorRef color = NSColor.labelColor.CGColor;
+    for (size_t i = first; i < _blocks.size() && kPreviewInsetY + _tops[i] - _offset < NSMaxY(dirtyRect); ++i) {
+        const CGFloat height = _blocks[i].height;
+        if (_blocks[i].length == 0) continue;
+        auto it = _frames.find(i);
+        if (it == _frames.end()) {
+            CTFramesetterRef setter = CTFramesetterCreateWithAttributedString((__bridge CFAttributedStringRef)[self stringFor:i]);
+            CGPathRef path = CGPathCreateWithRect(CGRectMake(0, 0, _textWidth, height + _lineHeight), nullptr);
+            it = _frames.emplace(i, CF<CTFrameRef>(CTFramesetterCreateFrame(setter, CFRangeMake(0, 0), path, nullptr))).first;
+            CGPathRelease(path);
+            CFRelease(setter);
+        }
+        CGContextSaveGState(ctx);
+        CGContextTranslateCTM(ctx, kPreviewInsetX, kPreviewInsetY + _tops[i] - _offset + height + _lineHeight);
+        CGContextScaleCTM(ctx, 1, -1);
+        CGContextSetTextMatrix(ctx, CGAffineTransformIdentity);
+        CGContextSetFillColorWithColor(ctx, color);
+        CTFrameDraw(it->second.get(), ctx);
+        CGContextRestoreGState(ctx);
+    }
+
+    const CGFloat total = _tops.back() + 2 * kPreviewInsetY, viewHeight = self.bounds.size.height;
+    if (_scrolling && total > viewHeight) {
+        const CGFloat knob = std::max<CGFloat>(24, viewHeight * viewHeight / total);
+        const CGFloat y = (viewHeight - knob) * _offset / (total - viewHeight);
+        [NSColor.tertiaryLabelColor setFill];
+        [[NSBezierPath bezierPathWithRoundedRect:NSMakeRect(self.bounds.size.width - 6, y + 3, 3, knob - 6) xRadius:1.5 yRadius:1.5] fill];
+    }
+}
+
+- (void)scrollWheel:(NSEvent*)event {
+    const CGFloat delta = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.scrollingDeltaY * _lineHeight * 3;
+    const CGFloat total = _tops.back() + 2 * kPreviewInsetY;
+    const CGFloat offset = std::clamp<CGFloat>(_offset - delta, 0, std::max<CGFloat>(0, total - self.bounds.size.height));
+    if (offset == _offset) return;
+    _offset = offset;
+    _scrolling = YES;
+    const NSInteger generation = ++_scrollGeneration;
+    __weak CRTextPreview* weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 800 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        CRTextPreview* preview = weakSelf;
+        if (!preview || preview->_scrollGeneration != generation) return;
+        preview->_scrolling = NO;
+        preview.needsDisplay = YES;
+    });
+    self.needsDisplay = YES;
+}
+
+@end
+
+// A picture, drawn directly.
+@interface CRImagePreview : CRView
+- (instancetype)initWithImage:(CGImageRef)image size:(NSSize)size;
+@end
+
+@implementation CRImagePreview {
+    CF<CGImageRef> _image;
+}
+
+- (instancetype)initWithImage:(CGImageRef)image size:(NSSize)size {
+    if ((self = [super initWithFrame:NSMakeRect(0, 0, size.width + 16, size.height + 16)])) {
+        CGImageRetain(image);
+        _image = CF<CGImageRef>(image);
+    }
+    return self;
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    CGContextRef ctx = NSGraphicsContext.currentContext.CGContext;
+    const CGRect rect = NSInsetRect(self.bounds, 8, 8);
+    CGContextSaveGState(ctx);
+    CGPathRef clip = CGPathCreateWithRoundedRect(rect, 6, 6, nullptr);
+    CGContextAddPath(ctx, clip);
+    CGContextClip(ctx);
+    CGPathRelease(clip);
+    CGContextTranslateCTM(ctx, rect.origin.x, rect.origin.y + rect.size.height);  // the view is flipped
+    CGContextScaleCTM(ctx, 1, -1);
+    CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, rect.size.width, rect.size.height), _image.get());
+    CGContextRestoreGState(ctx);
+}
+
+@end
+
 #pragma mark - Popup
 
 @implementation CRPopup {
@@ -659,21 +1147,20 @@ bool trace() {
     CRClipboard* _clipboard;
     CRPanel* _panel;
     NSView* _content;
-    NSTextField* _title;
-    CRIconView* _magnifier;
-    NSTextField* _search;
+    CRHeaderView* _header;
     CRRule* _topRule;
     CRRule* _bottomRule;
     CRListView* _list;
+    CRSettingsPage* _page;
     CRFooterButton* _clear;
     CRFooterButton* _settings;
     CRFooterButton* _quit;
-    NSTextView* _editor;
     NSPanel* _preview;
     NSInteger _previewGeneration;
     NSInteger _clearGeneration;
     BOOL _confirmingClear;
     BOOL _open;
+    BOOL _settingsMode;
     CGFloat _left, _top;  // where the panel's top-left corner sits while it is open
     std::unordered_map<uint64_t, crumb::Haystack> _haystacks;
 }
@@ -690,35 +1177,20 @@ bool trace() {
     return _open;
 }
 
-- (void)prepare {
+- (BOOL)recording {
+    return _page.recording;
+}
+
+// The window is built only when it opens and torn down when it closes, so a closed Crumb holds no views.
+- (void)build {
     if (_panel) return;
     _panel = (CRPanel*)makePanel(NSMakeRect(0, 0, kWidth, 300), CRPanel.class);
     _panel.popup = self;
     _panel.delegate = self;
 
     _content = [[CRFlippedView alloc] initWithFrame:NSMakeRect(0, 0, kWidth, 300)];
-
-    _title = [NSTextField labelWithString:@"Crumb"];
-    _title.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
-    _title.textColor = NSColor.labelColor;
-    [_title sizeToFit];
-    [_content addSubview:_title];
-
-    _magnifier = [[CRIconView alloc] initWithFrame:NSZeroRect];
-    _magnifier.icon = CRIconSearch;
-    [_content addSubview:_magnifier];
-
-    _search = [[NSTextField alloc] initWithFrame:NSZeroRect];
-    _search.bezeled = NO;
-    _search.bordered = NO;
-    _search.drawsBackground = NO;
-    _search.focusRingType = NSFocusRingTypeNone;
-    _search.font = [NSFont systemFontOfSize:14];
-    _search.cell.scrollable = YES;
-    _search.cell.wraps = NO;
-    _search.cell.usesSingleLineMode = YES;
-    _search.delegate = self;
-    [_content addSubview:_search];
+    _header = [[CRHeaderView alloc] initWithPopup:self];
+    [_content addSubview:_header];
 
     _topRule = [[CRRule alloc] initWithFrame:NSZeroRect];
     _bottomRule = [[CRRule alloc] initWithFrame:NSZeroRect];
@@ -740,7 +1212,7 @@ bool trace() {
     _settings.hasIcon = YES;
     _settings.toolTip = @"Settings (⌘,)";
     _settings.action = ^{
-        [weakSelf openSettings];
+        [weakSelf toggleSettings];
     };
     _quit = [[CRFooterButton alloc] initWithFrame:NSZeroRect];
     _quit.title = @"Quit Crumb";
@@ -757,61 +1229,120 @@ bool trace() {
     _panel.contentView = makeBackground(_content, kRadius);
 }
 
+- (void)releaseWindow {
+    if (_open || !_panel) return;
+    _panel.delegate = nil;
+    _panel.contentView = nil;
+    _panel = nil;
+    _content = nil;
+    _header = nil;
+    _topRule = nil;
+    _bottomRule = nil;
+    _list = nil;
+    _page = nil;
+    _clear = nil;
+    _settings = nil;
+    _quit = nil;
+}
+
 #pragma mark Showing
 
 - (void)toggle {
     if (_open)
         [self close];
     else
-        [self show];
+        [self showAt:NSEvent.mouseLocation settings:NO];
 }
 
-- (void)show {
+- (void)showSettings {
+    if (_open) {
+        if (!_settingsMode) [self toggleSettings];
+        return;
+    }
+    const NSRect visible = NSScreen.mainScreen.visibleFrame;
+    [self showAt:NSMakePoint(NSMidX(visible) - kWidth / 2, NSMidY(visible) + 180) settings:YES];
+}
+
+- (void)showAt:(NSPoint)point settings:(BOOL)settings {
     const CFTimeInterval start = CACurrentMediaTime();
-    [self prepare];
+    [self build];
     [_clipboard pollNow];
-    _search.stringValue = @"";
+    [_header clear];
     [self resetClear];
+    _settingsMode = settings;
     [self filter];
 
     // The top-left corner goes at the pointer, like a context menu.
-    const NSPoint pointer = NSEvent.mouseLocation;
-    const NSRect visible = screenAt(pointer).visibleFrame;
-    const CGFloat height = std::min(kHeader + [self listHeight] + kFooter, visible.size.height - 16);
-    _left = pointer.x + kWidth > NSMaxX(visible) ? pointer.x - kWidth : pointer.x;
+    const NSRect visible = screenAt(point).visibleFrame;
+    const CGFloat height = std::min(kHeader + [self bodyHeight] + kFooter, visible.size.height - 16);
+    _left = point.x + kWidth > NSMaxX(visible) ? point.x - kWidth : point.x;
     _left = std::clamp<CGFloat>(_left, NSMinX(visible) + 4, NSMaxX(visible) - kWidth - 4);
-    _top = std::clamp<CGFloat>(pointer.y, NSMinY(visible) + height + 4, NSMaxY(visible));
+    _top = std::clamp<CGFloat>(point.y, NSMinY(visible) + height + 4, NSMaxY(visible));
+    [self applyMode];
     [self layout];
 
     _open = YES;
     [_panel orderFrontRegardless];
     [_panel makeKeyWindow];
-    [_panel makeFirstResponder:_search];
-    [self updateSearchField];
-    [self schedulePreview];
+    [_panel makeFirstResponder:_header];
+    if (!settings) [self schedulePreview];
     if (trace()) NSLog(@"open %.1f ms (%ld rows)", (CACurrentMediaTime() - start) * 1000, (long)_list.count);
 }
 
-- (CGFloat)listHeight {
+- (CGFloat)bodyHeight {
+    if (_settingsMode) return _page.preferredHeight;
     return _list.count ? std::min(_list.contentHeight, kMaxList) : kEmptyList;
+}
+
+- (void)applyMode {
+    if (_settingsMode && !_page) {
+        __weak CRPopup* weakSelf = self;
+        CRFooterButton* check = nil;
+        if (self.updater.available) {
+            check = [[CRFooterButton alloc] initWithFrame:NSZeroRect];
+            check.title = @"Check for Updates";
+            check.action = ^{
+                CRPopup* popup = weakSelf;
+                [popup->_page checkForUpdates];
+            };
+        }
+        _page = [[CRSettingsPage alloc] initWithUpdater:self.updater checkButton:check];
+        _page.onLimit = ^(NSInteger limit) {
+            CRPopup* popup = weakSelf;
+            if (popup.onLimit) popup.onLimit(limit);
+        };
+        [_content addSubview:_page];
+    }
+    if (_settingsMode) [_page refresh];
+    _page.hidden = !_settingsMode;
+    _list.hidden = _settingsMode;
+    _clear.hidden = _settingsMode;
+    _settings.tint = _settingsMode ? NSColor.controlAccentColor : nil;
+    _header.title = _settingsMode ? @"Crumb Settings" : @"Crumb";
+}
+
+- (void)toggleSettings {
+    [self hidePreview];
+    ++_previewGeneration;
+    _settingsMode = !_settingsMode;
+    [_header clear];
+    if (!_settingsMode) [self filter];
+    [self applyMode];
+    [self layout];
+    [_panel makeFirstResponder:_header];
 }
 
 - (void)layout {
     const NSRect visible = screenAt(NSMakePoint(_left + 1, _top - 1)).visibleFrame;
-    const CGFloat height = std::min(kHeader + [self listHeight] + kFooter, std::max<CGFloat>(kHeader + kFooter + kRow, _top - NSMinY(visible) - 4));
-    const CGFloat listHeight = height - kHeader - kFooter;
+    const CGFloat height = std::min(kHeader + [self bodyHeight] + kFooter,
+                                    std::max<CGFloat>(kHeader + kFooter + kRow, _top - NSMinY(visible) - 4));
+    const CGFloat body = height - kHeader - kFooter;
     [_panel setFrame:NSMakeRect(_left, _top - height, kWidth, height) display:NO animate:NO];
     _content.frame = NSMakeRect(0, 0, kWidth, height);
-
-    const NSSize title = _title.frame.size;
-    _title.frame = NSMakeRect(16, std::round((kHeader - title.height) / 2), title.width, title.height);
-    const CGFloat glassX = NSMaxX(_title.frame) + 14;
-    _magnifier.frame = NSMakeRect(glassX, std::round((kHeader - 15) / 2), 15, 15);
-    const CGFloat fieldX = NSMaxX(_magnifier.frame) + 6;
-    _search.frame = NSMakeRect(fieldX, std::round((kHeader - 20) / 2), kWidth - fieldX - 16, 20);
-
+    _header.frame = NSMakeRect(0, 0, kWidth, kHeader);
     _topRule.frame = NSMakeRect(0, kHeader - 1, kWidth, 1);
-    _list.frame = NSMakeRect(0, kHeader, kWidth, listHeight);
+    _list.frame = NSMakeRect(0, kHeader, kWidth, body);
+    _page.frame = NSMakeRect(0, kHeader, kWidth, body);
     _bottomRule.frame = NSMakeRect(0, height - kFooter, kWidth, 1);
 
     const CGFloat footerY = height - kFooter + 6, buttonHeight = kFooter - 12;
@@ -830,11 +1361,10 @@ bool trace() {
     [_list clear];
     std::unordered_map<uint64_t, crumb::Haystack>().swap(_haystacks);
     [self resetClear];
-    // The whole window goes once AppKit is done with it (rebuilding it takes a few milliseconds), so a closed
-    // popup holds no layers or buffers. Then the freed memory goes back to the system.
+    // The window goes once AppKit is done with it, then the freed memory goes back to the system.
     __weak CRPopup* weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
-        [weakSelf teardown];
+        [weakSelf releaseWindow];
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         CRPopup* popup = weakSelf;
@@ -842,62 +1372,12 @@ bool trace() {
     });
 }
 
-- (void)teardown {
-    if (_open || !_panel) return;
-    [self releaseWindow];
-    // Build the next one now: views that have never been drawn hold no buffers, and opening stays instant.
-    [self prepare];
-}
-
-- (void)releaseWindow {
-    _panel.delegate = nil;
-    _panel.contentView = nil;
-    _panel = nil;
-    _content = nil;
-    _title = nil;
-    _magnifier = nil;
-    _search = nil;
-    _topRule = nil;
-    _bottomRule = nil;
-    _list = nil;
-    _clear = nil;
-    _settings = nil;
-    _quit = nil;
-    _editor = nil;
-}
-
-// A plain editor for the search field: no spell checking, autocorrection or substitutions (checking also
-// loads language models that would stay in memory).
-- (id)windowWillReturnFieldEditor:(NSWindow*)window toObject:(id)client {
-    if (client != _search) return nil;
-    if (!_editor) {
-        _editor = [[NSTextView alloc] initWithFrame:NSZeroRect];
-        _editor.fieldEditor = YES;
-        _editor.richText = NO;
-        _editor.importsGraphics = NO;
-        _editor.enabledTextCheckingTypes = 0;
-        _editor.continuousSpellCheckingEnabled = NO;
-        _editor.grammarCheckingEnabled = NO;
-        _editor.automaticSpellingCorrectionEnabled = NO;
-        _editor.automaticTextCompletionEnabled = NO;
-        _editor.automaticTextReplacementEnabled = NO;
-        _editor.automaticQuoteSubstitutionEnabled = NO;
-        _editor.automaticDashSubstitutionEnabled = NO;
-        _editor.automaticDataDetectionEnabled = NO;
-        _editor.automaticLinkDetectionEnabled = NO;
-        _editor.smartInsertDeleteEnabled = NO;
-        _editor.allowsUndo = YES;
-        if (@available(macOS 15.0, *)) _editor.writingToolsBehavior = NSWritingToolsBehaviorNone;
-    }
-    return _editor;
-}
-
 - (void)windowDidResignKey:(NSNotification*)notification {
     [self close];
 }
 
 - (void)reload {
-    if (!_open) return;
+    if (!_open || _settingsMode) return;
     const uint64_t selected = _list.selected >= 0 ? [_list idAt:_list.selected] : 0;
     [self filter];
     [self layout];
@@ -914,7 +1394,7 @@ bool trace() {
 
 - (void)filter {
     const auto& items = _store->items();
-    const crumb::Query query(_search.stringValue.UTF8String ?: "");
+    const crumb::Query query(_header.query.UTF8String ?: "");
     std::vector<Row> rows;
     if (query.empty()) {
         rows.resize(items.size());
@@ -946,56 +1426,44 @@ bool trace() {
     [_list setRows:std::move(rows)];
 }
 
-- (void)controlTextDidChange:(NSNotification*)notification {
-    [self updateSearchField];
+- (void)queryChanged {
+    if (trace()) NSLog(@"query: [%@]", _header.query);
+    if (_settingsMode) {  // typing on the settings page starts a search in the list
+        _settingsMode = NO;
+        [self applyMode];
+    }
     [self filter];
     [self layout];
     [self schedulePreview];
 }
 
-// The search field only shows while searching: until then the header is just the title, and typing anywhere
-// in the list starts a search.
-- (void)updateSearchField {
-    const BOOL searching = _search.stringValue.length > 0;
-    _magnifier.hidden = !searching;
-    _editor.insertionPointColor = searching ? NSColor.controlAccentColor : NSColor.clearColor;
-}
-
-- (BOOL)control:(NSControl*)control textView:(NSTextView*)textView doCommandBySelector:(SEL)command {
-    if (command == @selector(moveUp:)) return [self moveTo:_list.selected - 1];
-    if (command == @selector(moveDown:)) return [self moveTo:_list.selected + 1];
-    if (command == @selector(moveToBeginningOfDocument:) || command == @selector(scrollToBeginningOfDocument:))
-        return [self moveTo:0];
-    if (command == @selector(moveToEndOfDocument:) || command == @selector(scrollToEndOfDocument:))
-        return [self moveTo:_list.count - 1];
-    if (command == @selector(pageUp:) || command == @selector(scrollPageUp:))
-        return [self moveTo:std::max<NSInteger>(0, _list.selected - 10)];
-    if (command == @selector(pageDown:) || command == @selector(scrollPageDown:))
-        return [self moveTo:std::min<NSInteger>(_list.count - 1, _list.selected + 10)];
-    if (command == @selector(insertNewline:) || command == @selector(insertLineBreak:)) {
-        [self activate:_list.selected];
-        return YES;
-    }
+- (void)performCommand:(SEL)command {
     if (command == @selector(cancelOperation:)) {
-        [self close];
-        return YES;
+        if (_settingsMode)
+            [self toggleSettings];
+        else
+            [self close];
+        return;
     }
-    if (command == @selector(deleteWordBackward:)) {  // ⌥⌫ deletes the selected entry
-        [self deleteSelected];
-        return YES;
-    }
-    return NO;
+    if (_settingsMode) return;
+    if (command == @selector(moveUp:)) [self moveTo:_list.selected - 1];
+    else if (command == @selector(moveDown:)) [self moveTo:_list.selected + 1];
+    else if (command == @selector(moveToBeginningOfDocument:) || command == @selector(scrollToBeginningOfDocument:)) [self moveTo:0];
+    else if (command == @selector(moveToEndOfDocument:) || command == @selector(scrollToEndOfDocument:)) [self moveTo:_list.count - 1];
+    else if (command == @selector(pageUp:) || command == @selector(scrollPageUp:)) [self moveTo:std::max<NSInteger>(0, _list.selected - 10)];
+    else if (command == @selector(pageDown:) || command == @selector(scrollPageDown:))
+        [self moveTo:std::min<NSInteger>(_list.count - 1, _list.selected + 10)];
+    else if (command == @selector(insertNewline:) || command == @selector(insertLineBreak:)) [self activate:_list.selected];
+    else if (command == @selector(deleteWordBackward:)) [self deleteSelected];  // ⌥⌫ deletes the selected entry
 }
 
-- (BOOL)moveTo:(NSInteger)row {
-    if (_list.count == 0) return YES;
+- (void)moveTo:(NSInteger)row {
+    if (_list.count == 0) return;
     row = std::clamp<NSInteger>(row, 0, _list.count - 1);
-    if (row != _list.selected) {
-        _list.selected = row;
-        [_list scrollToSelection];
-        [self schedulePreview];
-    }
-    return YES;
+    if (row == _list.selected) return;
+    _list.selected = row;
+    [_list scrollToSelection];
+    [self schedulePreview];
 }
 
 - (BOOL)handleKeyEquivalent:(NSEvent*)event {
@@ -1010,13 +1478,13 @@ bool trace() {
                                             kVK_ANSI_Keypad7, kVK_ANSI_Keypad8, kVK_ANSI_Keypad9};
     for (NSInteger i = 0; i < 9; ++i) {
         if (event.keyCode == digits[i] || event.keyCode == keypad[i]) {
-            [self activate:i];
+            if (!_settingsMode) [self activate:i];
             return YES;
         }
     }
     NSString* key = CRKeyCharacter(event);
     if ([key isEqualToString:@","]) {
-        [self openSettings];
+        [self toggleSettings];
         return YES;
     }
     if ([key isEqualToString:@"q"]) {
@@ -1025,6 +1493,11 @@ bool trace() {
     }
     if ([key isEqualToString:@"w"]) {
         [self close];
+        return YES;
+    }
+    if ([key isEqualToString:@"v"]) {
+        if (_settingsMode) [self toggleSettings];
+        [_header paste];
         return YES;
     }
     return NO;
@@ -1089,11 +1562,6 @@ bool trace() {
     _clear.frame = NSMakeRect(NSMinX(_clear.frame), NSMinY(_clear.frame), [_clear fittingWidth], NSHeight(_clear.frame));
 }
 
-- (void)openSettings {
-    [self close];
-    if (self.onSettings) self.onSettings();
-}
-
 #pragma mark Preview
 
 - (void)schedulePreview {
@@ -1102,7 +1570,7 @@ bool trace() {
     __weak CRPopup* weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(kPreviewDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         CRPopup* popup = weakSelf;
-        if (popup && popup->_open && popup->_previewGeneration == generation) [popup showPreview];
+        if (popup && popup->_open && !popup->_settingsMode && popup->_previewGeneration == generation) [popup showPreview];
     });
 }
 
@@ -1121,78 +1589,37 @@ bool trace() {
     const CGFloat scale = _panel.backingScaleFactor ?: 2;
 
     NSView* view = nil;
-    NSSize size;
     if (item.kind == crumb::Kind::Image) {
         const CGFloat w = std::max<CGFloat>(1, item.width / 2.0), h = std::max<CGFloat>(1, item.height / 2.0);
         const CGFloat fit = std::min({CGFloat(1), (kPreviewMaxWidth - 16) / w, (maxHeight - 16) / h});
-        const NSSize image = NSMakeSize(std::max<CGFloat>(1, std::round(w * fit)), std::max<CGFloat>(1, std::round(h * fit)));
+        const NSSize size = NSMakeSize(std::max<CGFloat>(1, std::round(w * fit)), std::max<CGFloat>(1, std::round(h * fit)));
         CGImageRef picture = nullptr;
         NSURL* url = [NSURL fileURLWithPath:@(_store->imageFile(item).c_str())];
         if (CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)url, nullptr)) {
             NSDictionary* options = @{
                 (id)kCGImageSourceCreateThumbnailFromImageAlways : @YES,
                 (id)kCGImageSourceCreateThumbnailWithTransform : @YES,
-                (id)kCGImageSourceThumbnailMaxPixelSize : @(std::ceil(std::max(image.width, image.height) * scale)),
+                (id)kCGImageSourceThumbnailMaxPixelSize : @(std::ceil(std::max(size.width, size.height) * scale)),
             };
             picture = CGImageSourceCreateThumbnailAtIndex(source, 0, (__bridge CFDictionaryRef)options);
             CFRelease(source);
         }
         if (!picture) return;
-        NSImageView* imageView = [NSImageView imageViewWithImage:[[NSImage alloc] initWithCGImage:picture size:image]];
+        view = [[CRImagePreview alloc] initWithImage:picture size:size];
         CGImageRelease(picture);
-        imageView.imageScaling = NSImageScaleProportionallyUpOrDown;
-        imageView.frame = NSMakeRect(8, 8, image.width, image.height);
-        imageView.wantsLayer = YES;
-        imageView.layer.cornerRadius = 6;
-        imageView.layer.masksToBounds = YES;
-        size = NSMakeSize(image.width + 16, image.height + 16);
-        view = [[CRFlippedView alloc] initWithFrame:NSMakeRect(0, 0, size.width, size.height)];
-        [view addSubview:imageView];
     } else {
-        std::string bytes;
         // A few spare bytes let the cut fall on a character boundary.
-        bytes = crumb::readFile(_store->file(item.id, item.kind == crumb::Kind::Files ? "files" : "txt"), kPreviewMaxBytes + 3);
+        std::string bytes =
+            crumb::readFile(_store->file(item.id, item.kind == crumb::Kind::Files ? "files" : "txt"), kPreviewMaxBytes + 3);
         const bool cut = bytes.size() > kPreviewMaxBytes;
         bytes.resize(crumb::utf8Prefix(bytes, kPreviewMaxBytes).size());
         NSString* text = [[NSString alloc] initWithBytes:bytes.data() length:bytes.size() encoding:NSUTF8StringEncoding];
         if (!text) text = [[NSString alloc] initWithBytes:bytes.data() length:bytes.size() encoding:NSISOLatin1StringEncoding];
         if (cut) text = [text stringByAppendingString:@"\n…"];
         if (text.length == 0) return;
-
-        NSFont* font = [NSFont systemFontOfSize:13];
-        const CGFloat insetX = 14, insetY = 12;
-        CGFloat width = kPreviewMaxWidth, height = maxHeight;
-        if (text.length <= kMeasureLimit) {
-            NSMutableParagraphStyle* style = [NSMutableParagraphStyle new];
-            style.lineBreakMode = NSLineBreakByWordWrapping;
-            const NSRect bounds = [text boundingRectWithSize:NSMakeSize(kPreviewMaxWidth - 2 * insetX, CGFLOAT_MAX)
-                                                     options:NSStringDrawingUsesLineFragmentOrigin
-                                                  attributes:@{NSFontAttributeName : font, NSParagraphStyleAttributeName : style}];
-            width = std::min(kPreviewMaxWidth, std::ceil(bounds.size.width) + 2 * insetX + 2);
-            height = std::min(maxHeight, std::ceil(bounds.size.height) + 2 * insetY + 2);
-        }
-        size = NSMakeSize(std::max<CGFloat>(width, 120), std::max<CGFloat>(height, 36));
-        NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, size.width, size.height)];
-        scroll.drawsBackground = NO;
-        scroll.hasVerticalScroller = YES;
-        scroll.autohidesScrollers = YES;
-        scroll.scrollerStyle = NSScrollerStyleOverlay;
-        NSTextView* textView = [[NSTextView alloc] initWithFrame:scroll.bounds];
-        textView.editable = NO;
-        textView.selectable = NO;
-        textView.drawsBackground = NO;
-        textView.textContainerInset = NSMakeSize(insetX, insetY);
-        textView.textContainer.lineFragmentPadding = 0;
-        textView.textContainer.widthTracksTextView = YES;
-        textView.verticallyResizable = YES;
-        textView.horizontallyResizable = NO;
-        textView.autoresizingMask = NSViewWidthSizable;
-        textView.font = font;
-        textView.textColor = NSColor.labelColor;
-        textView.string = text;
-        scroll.documentView = textView;
-        view = scroll;
+        view = [[CRTextPreview alloc] initWithText:text maxWidth:kPreviewMaxWidth maxHeight:maxHeight];
     }
+    const NSSize size = view.frame.size;
 
     // Beside the list, level with the selected row; on the other side if there is no room.
     const NSRect panel = _panel.frame;
@@ -1204,7 +1631,6 @@ bool trace() {
     const CGFloat y = std::clamp<CGFloat>(rowTop - size.height, NSMinY(visible) + 4, NSMaxY(visible) - size.height);
 
     _preview = makePanel(NSMakeRect(x, y, size.width, size.height), NSPanel.class);
-    view.frame = NSMakeRect(0, 0, size.width, size.height);
     _preview.contentView = makeBackground(view, 12);
     [_preview orderFrontRegardless];
 }

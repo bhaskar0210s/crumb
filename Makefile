@@ -1,5 +1,5 @@
 APP       := Crumb
-VERSION   := 1.0.0
+VERSION   := 1.1.0
 BUILD     := build
 BUNDLE    := $(BUILD)/$(APP).app
 BINARY    := $(BUNDLE)/Contents/MacOS/$(APP)

@@ -14,6 +14,14 @@ extern NSString* const CRHotKeyModifiersKey;
 extern NSString* const CRHistorySizeKey;
 extern NSString* const CRCheckForUpdatesKey;
 
+// Renders a view's drawing on the CPU into an 8-bit image used as its layer's contents. The system's own
+// drawing path moves larger views onto the GPU, which loads a couple of megabytes of shaders for good.
+void CRRenderIntoLayer(NSView* view, void (^draw)(NSRect bounds));
+
+// A flipped view drawn through CRRenderIntoLayer: subclasses just implement drawRect:.
+@interface CRView : NSView
+@end
+
 // Watches the general pasteboard and puts entries back on it.
 @interface CRClipboard : NSObject
 - (instancetype)initWithStore:(crumb::Store*)store;
@@ -28,28 +36,35 @@ extern NSString* const CRCheckForUpdatesKey;
 @property(nonatomic, readonly) BOOL busy;  // copies are still being saved
 @end
 
-// The history list that opens at the pointer.
-@interface CRPopup : NSObject <NSWindowDelegate, NSTextFieldDelegate>
+@class CRUpdater;
+
+// The history list that opens at the pointer. Its gear turns it into the settings page.
+@interface CRPopup : NSObject <NSWindowDelegate>
 - (instancetype)initWithStore:(crumb::Store*)store clipboard:(CRClipboard*)clipboard;
-@property(nonatomic, copy, nullable) void (^onSettings)(void);
+@property(nonatomic, weak, nullable) CRUpdater* updater;
+@property(nonatomic, copy, nullable) void (^onLimit)(NSInteger limit);
 @property(nonatomic, readonly) BOOL isOpen;
-- (void)prepare;
 - (void)toggle;
+- (void)showSettings;  // the settings page, in the middle of the screen
 - (void)close;
 - (void)reload;
 @end
 
 @interface CRUpdater : NSObject
 - (instancetype)initWithPopup:(CRPopup*)popup;
-@property(nonatomic, readonly) BOOL available;  // false when the build doesn't know its repository
+@property(nonatomic, readonly) BOOL available;  // false when the build can't verify updates
 - (void)start;
 - (void)checkNow:(void (^)(NSString* status))report;
 @end
 
-@interface CRSettings : NSObject <NSWindowDelegate>
-- (instancetype)initWithUpdater:(CRUpdater*)updater;
+// Shortcut, launch at login, automatic updates and history size, drawn inside the list's panel.
+@interface CRSettingsPage : CRView
+- (instancetype)initWithUpdater:(nullable CRUpdater*)updater checkButton:(nullable NSView*)checkButton;
 @property(nonatomic, copy, nullable) void (^onLimit)(NSInteger limit);
-- (void)show;
+@property(nonatomic, readonly) CGFloat preferredHeight;
+@property(nonatomic, readonly) BOOL recording;  // the shortcut field is waiting for keys
+- (void)refresh;
+- (void)checkForUpdates;
 @end
 
 // The global shortcut, a Carbon hot key: it needs no special permission.
@@ -74,6 +89,8 @@ BOOL CRHandleEditingKey(NSEvent* event);
 @interface CRShortcutField : NSControl
 @property(nonatomic) UInt32 keyCode;
 @property(nonatomic) UInt32 modifiers;
+@property(nonatomic, readonly) BOOL recording;
+@property(nonatomic, weak, nullable) NSResponder* returnResponder;  // gets the keyboard back after recording
 @end
 
 NS_ASSUME_NONNULL_END

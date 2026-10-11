@@ -1,8 +1,10 @@
-// Crumb's few icons, drawn with paths (system symbol images would load the whole symbol catalog into memory
-// for six glyphs), and the editing shortcuts that a menu bar would otherwise provide.
+// Drawing helpers shared by Crumb's views: CPU rendering into layers, the few icons (drawn with paths: system
+// symbol images would load the whole symbol catalog for six glyphs), and the editing shortcuts that a menu
+// bar would otherwise provide.
 
 #import "app.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace {
@@ -119,3 +121,57 @@ BOOL CRHandleEditingKey(NSEvent* event) {
     }
     return action && [NSApp sendAction:action to:nil from:nil];
 }
+
+void CRRenderIntoLayer(NSView* view, void (^draw)(NSRect bounds)) {
+    const NSSize size = view.bounds.size;
+    const CGFloat scale = view.window.backingScaleFactor ?: 2;
+    const auto width = static_cast<size_t>(std::ceil(size.width * scale));
+    const auto height = static_cast<size_t>(std::ceil(size.height * scale));
+    if (width == 0 || height == 0) {
+        view.layer.contents = nil;
+        return;
+    }
+    CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef ctx =
+        CGBitmapContextCreate(nullptr, width, height, 8, 0, space, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Host);
+    CGColorSpaceRelease(space);
+    if (!ctx) return;
+    CGContextScaleCTM(ctx, scale, scale);
+    CGContextTranslateCTM(ctx, 0, size.height);
+    CGContextScaleCTM(ctx, 1, -1);
+    [NSGraphicsContext saveGraphicsState];
+    NSGraphicsContext.currentContext = [NSGraphicsContext graphicsContextWithCGContext:ctx flipped:YES];
+    draw(view.bounds);
+    [NSGraphicsContext restoreGraphicsState];
+    CGImageRef image = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    view.layer.contentsScale = scale;
+    view.layer.contents = (__bridge id)image;
+    CGImageRelease(image);
+}
+
+@implementation CRView
+
+- (instancetype)initWithFrame:(NSRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        self.wantsLayer = YES;
+        self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawOnSetNeedsDisplay;
+    }
+    return self;
+}
+
+- (BOOL)isFlipped {
+    return YES;
+}
+
+- (BOOL)wantsUpdateLayer {
+    return YES;
+}
+
+- (void)updateLayer {
+    CRRenderIntoLayer(self, ^(NSRect bounds) {
+        [self drawRect:bounds];
+    });
+}
+
+@end

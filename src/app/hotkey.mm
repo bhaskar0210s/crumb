@@ -132,7 +132,6 @@ NSString* CRShortcutName(UInt32 keyCode, UInt32 modifiers) {
 }
 
 @implementation CRShortcutField {
-    BOOL _recording;
     UInt32 _live;  // modifiers held while recording
 }
 
@@ -142,6 +141,16 @@ NSString* CRShortcutName(UInt32 keyCode, UInt32 modifiers) {
 
 - (BOOL)acceptsFirstMouse:(NSEvent*)event {
     return YES;
+}
+
+- (BOOL)wantsUpdateLayer {
+    return YES;
+}
+
+- (void)updateLayer {
+    CRRenderIntoLayer(self, ^(NSRect bounds) {
+        [self drawRect:bounds];
+    });
 }
 
 - (void)setKeyCode:(UInt32)keyCode {
@@ -154,14 +163,21 @@ NSString* CRShortcutName(UInt32 keyCode, UInt32 modifiers) {
     self.needsDisplay = YES;
 }
 
+- (BOOL)isFlipped {
+    return YES;
+}
+
 - (void)drawRect:(NSRect)dirtyRect {
     const NSRect box = NSInsetRect(self.bounds, 0.5, 0.5);
-    NSBezierPath* path = [NSBezierPath bezierPathWithRoundedRect:box xRadius:6 yRadius:6];
-    [(_recording ? [NSColor.controlAccentColor colorWithAlphaComponent:0.12] : NSColor.controlBackgroundColor) setFill];
+    NSBezierPath* path = [NSBezierPath bezierPathWithRoundedRect:box xRadius:7 yRadius:7];
+    [(_recording ? [NSColor.controlAccentColor colorWithAlphaComponent:0.14] : [NSColor.labelColor colorWithAlphaComponent:0.08])
+        setFill];
     [path fill];
-    [(_recording ? NSColor.controlAccentColor : NSColor.separatorColor) setStroke];
-    path.lineWidth = 1;
-    [path stroke];
+    if (_recording) {
+        [NSColor.controlAccentColor setStroke];
+        path.lineWidth = 1;
+        [path stroke];
+    }
 
     NSString* text;
     NSColor* color = NSColor.labelColor;
@@ -198,6 +214,11 @@ NSString* CRShortcutName(UInt32 keyCode, UInt32 modifiers) {
     _live = 0;
     CRRegisterHotKey(_keyCode, _modifiers);
     self.needsDisplay = YES;
+    [self handBack];
+}
+
+- (void)handBack {
+    if (self.window.firstResponder == self) [self.window makeFirstResponder:self.returnResponder];
 }
 
 - (BOOL)resignFirstResponder {
@@ -250,7 +271,7 @@ NSString* CRShortcutName(UInt32 keyCode, UInt32 modifiers) {
     [NSUserDefaults.standardUserDefaults setInteger:keyCode forKey:CRHotKeyCodeKey];
     [NSUserDefaults.standardUserDefaults setInteger:modifiers forKey:CRHotKeyModifiersKey];
     self.needsDisplay = YES;
-    [self.window makeFirstResponder:nil];
+    [self handBack];
 }
 
 @end
