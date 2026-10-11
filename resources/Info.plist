@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Crumb</string>
+	<key>CFBundleExecutable</key>
+	<string>Crumb</string>
+	<key>CFBundleIconFile</key>
+	<string>Crumb</string>
+	<key>CFBundleIdentifier</key>
+	<string>app.crumb.Crumb</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Crumb</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>__VERSION__</string>
+	<key>CFBundleVersion</key>
+	<string>__VERSION__</string>
+	<key>CrumbRepository</key>
+	<string>__REPOSITORY__</string>
+	<key>CrumbUpdateKey</key>
+	<string>BOAfI2lKFNa/CyGCS2c+nkt7uxGHz/Y1+SZGU5HQ6qiYkxF2h13mpG4Q8Lo4C+CiTS2skpda+FT1BkUkp94uCdQ=</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>LSMultipleInstancesProhibited</key>
+	<true/>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Free and open source under the MIT License.</string>
+</dict>
+</plist>
