@@ -11,17 +11,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Xcode
-        run: xcodebuild -version
+        run: |
+          xcodebuild -version
+          swiftc --version
       - name: Unit tests
         run: make test
       - name: Build
-        run: |
-          make REPOSITORY="$GITHUB_REPOSITORY"
+        run: make dmg REPOSITORY="$GITHUB_REPOSITORY"
       - name: Package
-        run: |
-          ditto -c -k --keepParent build/Crumb.app Crumb.zip
+        run: ditto -c -k --keepParent build/Crumb.app Crumb.zip
       - uses: actions/upload-artifact@v7
         with:
           name: Crumb
           path: |
             Crumb.zip
+            build/Crumb.dmg

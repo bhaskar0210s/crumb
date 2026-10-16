@@ -4,7 +4,7 @@
 
 <p align="center"><b>A tiny clipboard history for your Mac.</b><br>
 Press <kbd>⇧</kbd><kbd>⌘</kbd><kbd>C</kbd> anywhere to see everything you copied: text, pictures and files.<br>
-About 400 KB on disk, 6 MB of memory at launch and about 9 MB after use, no CPU while idle.</p>
+About 500 KB on disk, 7 MB of memory at launch and 9 to 12 MB after use, no CPU while idle.</p>
 
 <p align="center">
   <img src="docs/popup-dark.png" width="430" alt="Crumb's list in dark mode">
@@ -45,11 +45,26 @@ updates and how many entries to keep (100 by default).
 
 ## Install
 
-Crumb runs on Macs with Apple silicon, on macOS 27 or later.
+Crumb runs on Macs with Apple silicon, on macOS 27 or later. Install it with Homebrew:
 
-**Download:** grab `Crumb.zip` from the [latest release](../../releases/latest), unzip it and move `Crumb.app` to
-Applications. Crumb isn't notarized by Apple, so the first time you open it macOS asks you to confirm: open it
-once, then choose **Open Anyway** in System Settings → Privacy & Security.
+```sh
+brew install bhaskar0210s/tap/crumb
+```
+
+Or without Homebrew, with one command in Terminal:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bhaskar0210s/crumb/main/install.sh | sh
+```
+
+It downloads the latest release, checks it against the signature of Crumb's release key, installs it in Applications
+and opens it. Both ways, Crumb opens right away.
+
+**Or download it:** get `Crumb.dmg` from the [latest release](../../releases/latest), open it and drag Crumb to
+Applications. macOS checks apps downloaded in a browser with Apple, and Crumb isn't notarized (that needs a paid
+Apple developer account), so the first time you open it macOS says it can't verify that Crumb is free of malware.
+Choose **Done**, then open System Settings → Privacy & Security and click **Open Anyway** next to Crumb. You only
+need to do this once.
 
 macOS also asks before an app reads what you copied in other apps. Allow Crumb, or turn it on in System Settings →
 Privacy & Security → Paste from Other Apps. If macOS still asks or refuses, Crumb's settings say so.
@@ -68,8 +83,8 @@ from Spotlight) for its settings.
 
 ## How it stays small
 
-- **Native code only.** A C++ core keeps the history and does the searching; a thin AppKit layer draws everything
-  with Core Text and Core Graphics. No web views, no third-party libraries.
+- **Native code only.** Swift and AppKit, with Core Text and Core Graphics drawing everything. No SwiftUI, no web
+  views, no third-party libraries.
 - **No system text fields.** The search box is drawn by Crumb, which reads the keyboard itself. A standard text
   field would load macOS's whole text engine and make the system start an AutoFill helper process (about 13 MB)
   just for Crumb. Input methods (Chinese, Japanese, Korean…) still work: Crumb asks for the text input system
@@ -77,6 +92,12 @@ from Spotlight) for its settings.
 - **Drawn on the CPU, into shared memory.** Every view renders into an IOSurface that the window server composites
   straight from, so the pixels exist once. A plain image would be copied for the window server, and the system's
   default path moves larger views onto the GPU, which loads a couple of megabytes of shaders that never go away.
+  Pictures sit on layers of their own, in their own color profile, and the window server matches them to the
+  display.
+- **One color space for every window.** Left to the display's color profile, AppKit and Core Animation convert
+  through a new ColorSync transform for each window and keep its 272 KB lookup table: one more every time the list
+  or a preview opens, which added up to 13 MB in an earlier version. Crumb's windows use sRGB, which it draws in
+  anyway.
 - **Nothing is kept while the list is closed.** Its window is built when you press the shortcut (in about 10 ms)
   and torn down when it closes. Settings live inside the same panel instead of a window of their own. A preview
   lets go of its decoded picture as soon as it is drawn.
@@ -90,39 +111,48 @@ from Spotlight) for its settings.
 - **Cheap watching.** macOS doesn't announce copies, so Crumb reads the pasteboard's change count twice a
   second, which costs next to nothing.
 
-Measured on an Apple silicon Mac running macOS 27, with a full history of 100 entries: about 6 MB right after
-launch, 13 MB while the list is open (16 to 20 MB with a full-size preview) and about 9 MB once it has closed,
-steady over hundreds of opens, with no helper processes. Copying a 20 MB picture peaks at about 50 MB while it is
-saved, then memory returns to where it was. CPU use while idle is 0.0%.
+Measured with `footprint` (the number Activity Monitor shows) on an Apple silicon Mac running macOS 27, with a full
+history of 100 entries that includes pictures in six different color profiles: about 7 MB right after launch,
+14 MB while the list is open (up to about 20 MB with a full-size preview or a search running) and 9 to 12 MB once
+it has closed, flat over a 30-minute soak, with no helper processes. The list opens in about 10 ms (40 ms the
+first time after launch). Copying a 20 MB picture peaks at about 50 MB while it is saved, then memory returns to
+where it was. CPU use while idle is 0.0%.
 
 ## Tested
 
 - `make test` runs the core's unit tests (history storage, fuzzy search, text handling and version checks) with
-  AddressSanitizer and UndefinedBehaviorSanitizer.
-- `leaks` finds nothing from Crumb after hundreds of opens, searches, previews and copies. It does report a few
-  cycles inside Apple's AppIntents framework that every AppKit app gets on macOS 27.
-- Stress tests cover a 55 MB text, an 8K picture and 100 entries copied back to back. Every byte is kept, and
-  the list still opens in about 10 ms.
+  AddressSanitizer.
+- `leaks` finds nothing from Crumb after a session of opens, searches, previews and copies, or after a 30-minute
+  soak. It does report a small cycle inside Apple's AppIntents framework that every AppKit app gets on macOS 27.
+- A 30-minute soak (an open with a preview every 30 seconds, searches, and copies of text and screenshots) stays
+  flat at about 12 MB.
+- Stress tests cover a 53 MB text, an 8K picture and copies made back to back. Every byte is kept.
+- Installing, upgrading and uninstalling with Homebrew print no warnings, and the installed app opens without a
+  prompt.
 
 ## Development
 
 ```sh
 make              # build/Crumb.app
+make dmg          # build/Crumb.dmg
 make run          # build and start it from build/
 make test         # unit tests
 make icon         # redraw resources/Crumb.icns
 ```
 
-`src/core` holds the history store and the fuzzy search (plain C++), and `src/app` the AppKit side. Pushing a tag
-such as `v1.0.1` builds the download on GitHub, signs it and publishes a release. Installed copies with
+`Sources/Core` holds the history store and the fuzzy search, and `Sources/App` the AppKit side. Pushing a tag such
+as `v2.0.1` builds Crumb on GitHub, signs it, publishes a release with `Crumb.dmg` and `Crumb.zip`, and updates the
+cask in [bhaskar0210s/homebrew-tap](https://github.com/bhaskar0210s/homebrew-tap). Installed copies with
 automatic updates turned on install it within a day.
 
 Releases are signed with an ECDSA P-256 key kept in the repository secret `UPDATE_SIGNING_KEY` (PEM). Its public
-half is `CrumbUpdateKey` in `resources/Info.plist`. A fork that publishes its own releases needs its own key pair:
+half is `CrumbUpdateKey` in `resources/Info.plist`, and also sits in `install.sh`. A fork that publishes its own
+releases needs its own key pair:
 
 ```sh
 openssl ecparam -name prime256v1 -genkey -noout -out update-key.pem             # keep this private
 openssl ec -in update-key.pem -pubout -outform DER | tail -c 65 | base64        # goes into Info.plist
+openssl ec -in update-key.pem -pubout                                           # goes into install.sh
 ```
 
 ## License

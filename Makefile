@@ -1,46 +1,50 @@
 APP       := Crumb
-VERSION   := 1.2.0
+VERSION   := 2.0.0
 BUILD     := build
 BUNDLE    := $(BUILD)/$(APP).app
 BINARY    := $(BUNDLE)/Contents/MacOS/$(APP)
+DMG       := $(BUILD)/$(APP).dmg
 PREFIX    ?= /Applications
 
 # The GitHub repository that updates come from ("owner/name"), taken from the clone's origin.
 REPOSITORY ?= $(shell git remote get-url origin 2>/dev/null | sed -E 's,^(git@github\.com:|https://github\.com/),,; s,\.git$$,,')
 
-CXX       := clang++
+SWIFTC    := swiftc
 MIN_MACOS := 27.0
-TARGET    := -arch arm64 -mmacosx-version-min=$(MIN_MACOS)
+TARGET    := -target arm64-apple-macos$(MIN_MACOS) -swift-version 6
 
-CORE_SRC  := $(wildcard src/core/*.cpp)
-APP_SRC   := $(wildcard src/app/*.mm)
-CORE_OBJ  := $(CORE_SRC:src/%.cpp=$(BUILD)/obj/%.o)
-APP_OBJ   := $(APP_SRC:src/%.mm=$(BUILD)/obj/%.o)
+CORE_SRC  := $(wildcard Sources/Core/*.swift)
+APP_SRC   := $(wildcard Sources/App/*.swift)
 
-CXXFLAGS  += $(TARGET) -std=c++20 -Oz -flto -Wall -Wextra -Wshadow -Wno-unused-parameter -fvisibility=hidden -MMD -MP
-OBJCFLAGS := -fobjc-arc
-LDFLAGS   += $(TARGET) -dead_strip -flto
-LIBS      := -framework AppKit -framework Carbon -framework ServiceManagement -framework ImageIO -framework QuartzCore \
-             -framework CoreText -framework Security -framework IOSurface
+# Small and fast: one optimized module, no reflection metadata, unused code stripped.
+SWIFTFLAGS := $(TARGET) -Osize -wmo -Xfrontend -disable-reflection-metadata -Xlinker -dead_strip
+
+# Code signing identity: "-" (ad hoc) for local builds. Releases are signed with the project's own certificate
+# (SHA-1 below), so every version has the same designated requirement: macOS keeps Crumb's permissions across
+# updates, and Homebrew sees the same signer when it upgrades the cask.
+RELEASE_ID    := 81F65FC5A119EA54887FA776BB93DAB3F18BAE31
+SIGN_ID       ?= -
+SIGN_KEYCHAIN ?=
+SIGN          := codesign --force --sign "$(SIGN_ID)" $(if $(SIGN_KEYCHAIN),--keychain "$(SIGN_KEYCHAIN)") --timestamp=none
 
 ICON      := resources/$(APP).icns
 RESOURCES := $(BUNDLE)/Contents/Info.plist $(if $(wildcard $(ICON)),$(BUNDLE)/Contents/Resources/$(APP).icns)
 
-.PHONY: all app run test install uninstall icon clean
+.PHONY: all app dmg release run test install uninstall icon clean
 
 all: app
 
 app: $(BUILD)/.signed
 
-# Ad-hoc sign whenever something in the bundle changed.
+# Sign whenever something in the bundle changed.
 $(BUILD)/.signed: $(BINARY) $(RESOURCES)
-	@codesign --force --sign - $(BUNDLE)
+	@$(SIGN) $(BUNDLE)
 	@touch $@
 	@echo "Built $(BUNDLE) ($$(du -sh $(BUNDLE) | cut -f1))"
 
-$(BINARY): $(CORE_OBJ) $(APP_OBJ)
+$(BINARY): $(CORE_SRC) $(APP_SRC)
 	@mkdir -p $(@D)
-	$(CXX) $(LDFLAGS) $^ -o $@ $(LIBS)
+	$(SWIFTC) $(SWIFTFLAGS) -module-name $(APP) $^ -o $@
 	@strip -x $@
 
 $(BUNDLE)/Contents/Info.plist: resources/Info.plist Makefile
@@ -51,21 +55,32 @@ $(BUNDLE)/Contents/Resources/$(APP).icns: $(ICON)
 	@mkdir -p $(@D)
 	@cp $< $@
 
-$(BUILD)/obj/%.o: src/%.cpp
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+# A disk image to drag Crumb into Applications from.
+dmg: app
+	@rm -rf $(BUILD)/dmg $(DMG)
+	@mkdir -p $(BUILD)/dmg
+	@ditto $(BUNDLE) $(BUILD)/dmg/$(APP).app
+	@ln -s /Applications $(BUILD)/dmg/Applications
+	@hdiutil create -quiet -volname $(APP) -srcfolder $(BUILD)/dmg -fs HFS+ -format ULMO -ov $(DMG)
+	@rm -rf $(BUILD)/dmg
+	@echo "Built $(DMG) ($$(du -sh $(DMG) | cut -f1))"
 
-$(BUILD)/obj/%.o: src/%.mm
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) -c $< -o $@
+# Certificate-signed app and disk image for GitHub releases (see .github/workflows/release.yml).
+release:
+	@$(MAKE) clean
+	@$(MAKE) dmg SIGN_ID="$(RELEASE_ID)" SIGN_KEYCHAIN="$(SIGN_KEYCHAIN)" VERSION="$(VERSION)" REPOSITORY="$(REPOSITORY)"
+	@codesign --verify --deep --strict $(BUNDLE)
+	@codesign -d -r- $(BUNDLE) 2>&1 | grep -q 'certificate leaf' || (echo "release is not certificate-signed" && false)
+	@test "$$(lipo -archs $(BINARY))" = arm64 || (echo "release is not arm64 only" && false)
+	@vtool -show-build $(BINARY) | grep -q "minos $(MIN_MACOS)" || (echo "release has the wrong minimum macOS" && false)
 
-# Unit tests for the core (history store, fuzzy search, text helpers).
+# Unit tests for the core (history store, fuzzy search, text helpers), with AddressSanitizer.
 test: $(BUILD)/tests
 	@$(BUILD)/tests
 
-$(BUILD)/tests: tests/core_tests.cpp $(CORE_SRC) src/core/*.hpp
+$(BUILD)/tests: $(CORE_SRC) tests/main.swift
 	@mkdir -p $(@D)
-	$(CXX) -std=c++20 -O1 -g -Wall -Wextra -fsanitize=address,undefined tests/core_tests.cpp $(CORE_SRC) -o $@
+	$(SWIFTC) $(TARGET) -Onone -g -sanitize=address -module-name CrumbTests $^ -o $@
 
 run: app
 	@pkill -x $(APP) || true
@@ -82,14 +97,12 @@ uninstall:
 	@pkill -x $(APP) || true
 	@rm -rf "$(PREFIX)/$(APP).app"
 
-icon: tools/icon.cpp
+icon: tools/icon.swift
 	@mkdir -p $(BUILD)/icon.iconset
-	$(CXX) -std=c++20 -O2 $< -o $(BUILD)/icon -framework CoreGraphics -framework ImageIO -framework CoreFoundation
+	$(SWIFTC) $(TARGET) -O $< -o $(BUILD)/icon
 	@$(BUILD)/icon $(BUILD)/icon.iconset
 	@iconutil -c icns $(BUILD)/icon.iconset -o $(ICON)
 	@echo "Wrote $(ICON)"
 
 clean:
 	rm -rf $(BUILD)
-
--include $(CORE_OBJ:.o=.d) $(APP_OBJ:.o=.d)
