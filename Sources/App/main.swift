@@ -59,8 +59,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updater.start()
 
         // Launch at login is on unless it was turned off in Crumb's settings. A new version can lose its login item
-        // (macOS ties it to the app's signature), so Crumb asks for it again whenever it is wanted but missing.
-        if installedInApplications(), defaults.bool(forKey: Defaults.launchAtLogin), SMAppService.mainApp.status == .notRegistered {
+        // (macOS ties it to the app's signature and then reports it as not found), so Crumb asks for it again whenever
+        // it is wanted but missing.
+        let status = SMAppService.mainApp.status
+        if installedInApplications(), defaults.bool(forKey: Defaults.launchAtLogin), status == .notRegistered || status == .notFound {
             try? SMAppService.mainApp.register()
         }
         if !defaults.bool(forKey: Defaults.launchedBefore) {
