@@ -58,7 +58,8 @@ curl -fsSL https://raw.githubusercontent.com/bhaskar0210s/crumb/main/install.sh 
 ```
 
 It downloads the latest release, checks it against the signature of Crumb's release key, installs it in Applications
-and opens it. Both ways, Crumb opens right away.
+and opens it. After a Homebrew install, open Crumb once from Applications or Spotlight. Either way, macOS opens it
+without any warning.
 
 **Or download it:** get `Crumb.dmg` from the [latest release](../../releases/latest), open it and drag Crumb to
 Applications. macOS checks apps downloaded in a browser with Apple, and Crumb isn't notarized (that needs a paid
